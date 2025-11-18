@@ -27,23 +27,28 @@ import { GoogleCredentialProvider } from '../mcp/google-auth-provider.js';
 import { ServiceAccountImpersonationProvider } from '../mcp/sa-impersonation-provider.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
 
+import { createServer } from 'node:http';
 import type { FunctionDeclaration } from '@google/genai';
 import { mcpToTool } from '@google/genai';
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { MCPOAuthProvider } from '../mcp/oauth-provider.js';
+import { MCPOAuthClientProvider } from '../mcp/mcp-oauth-provider.js';
 import { MCPOAuthTokenStorage } from '../mcp/oauth-token-storage.js';
 import { OAuthUtils } from '../mcp/oauth-utils.js';
 import type { PromptRegistry } from '../prompts/prompt-registry.js';
 import { getErrorMessage } from '../utils/errors.js';
+import { exec } from 'node:child_process';
 import type {
   Unsubscribe,
   WorkspaceContext,
 } from '../utils/workspaceContext.js';
+import type { OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { ToolRegistry } from './tool-registry.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
 import { coreEvents } from '../utils/events.js';
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
 
 export const MCP_DEFAULT_TIMEOUT_MSEC = 10 * 60 * 1000; // default to 10 minutes
 
@@ -378,6 +383,7 @@ async function handleAutomaticOAuth(
       `Starting OAuth authentication for server '${mcpServerName}'...`,
     );
     const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
+    debugLogger.log(`Aashvi-2 before authenticate...`);
     await authProvider.authenticate(mcpServerName, oauthAuthConfig, serverUrl);
 
     debugLogger.log(
@@ -392,6 +398,47 @@ async function handleAutomaticOAuth(
     );
     return false;
   }
+}
+
+/**
+ * Opens the authorization URL in the user's default browser
+ */
+async function openBrowser(url: string): Promise<void> {
+  console.log(`🌐 Opening browser for authorization: ${url}`);
+
+  const command = `open "${url}"`;
+
+  exec(command, (error) => {
+    if (error) {
+      console.error(`Failed to open browser: ${error.message}`);
+      console.log(`Please manually open: ${url}`);
+    }
+  });
+}
+
+let sharedMcpOAuthClientProvider: MCPOAuthClientProvider | undefined;
+function getSharedMcpOAuthClientProvider(): MCPOAuthClientProvider {
+  if (!sharedMcpOAuthClientProvider) {
+    const CALLBACK_PORT = 8090;
+    const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/callback`;
+    const clientMetadata: OAuthClientMetadata = {
+      client_name: 'Simple OAuth MCP Client',
+      redirect_uris: [CALLBACK_URL],
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'client_secret_post',
+      scope: 'mcp:tools',
+    };
+    sharedMcpOAuthClientProvider = new MCPOAuthClientProvider(
+      CALLBACK_URL,
+      clientMetadata,
+      (redirectUrl: URL) => {
+        console.log(`📌 OAuth redirect handler called - opening browser`);
+        openBrowser(redirectUrl.toString());
+      },
+    );
+  }
+  return sharedMcpOAuthClientProvider;
 }
 
 /**
@@ -774,6 +821,75 @@ export function hasNetworkTransport(config: MCPServerConfig): boolean {
 }
 
 /**
+ * Example OAuth callback handler - in production, use a more robust approach
+ * for handling callbacks and storing tokens
+ */
+/**
+ * Starts a temporary HTTP server to receive the OAuth callback
+ */
+export async function waitForOAuthCallback(): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const server = createServer((req, res) => {
+      // Ignore favicon requests
+      if (req.url === '/favicon.ico') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      console.log(`📥 Received callback: ${req.url}`);
+      const parsedUrl = new URL(req.url || '', 'http://localhost');
+      const code = parsedUrl.searchParams.get('code');
+      const error = parsedUrl.searchParams.get('error');
+
+      if (code) {
+        console.log(
+          `✅ Authorization code received: ${code?.substring(0, 10)}...`,
+        );
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`
+            <html>
+              <body>
+                <h1>Authorization Successful!</h1>
+                <p>You can close this window and return to the terminal.</p>
+                <script>setTimeout(() => window.close(), 2000);</script>
+              </body>
+            </html>
+          `);
+
+        resolve(code);
+        setTimeout(() => server.close(), 3000);
+      } else if (error) {
+        console.log(`❌ Authorization error: ${error}`);
+        res.writeHead(400, { 'Content-Type': 'text/html' });
+        res.end(`
+            <html>
+              <body>
+                <h1>Authorization Failed</h1>
+                <p>Error: ${error}</p>
+              </body>
+            </html>
+          `);
+        reject(new Error(`OAuth authorization failed: ${error}`));
+      } else {
+        console.log(`❌ No authorization code or error in callback`);
+        res.writeHead(400);
+        res.end('Bad request');
+        reject(new Error('No authorization code provided'));
+      }
+    });
+
+    const CALLBACK_PORT = 8090;
+
+    server.listen(CALLBACK_PORT, () => {
+      console.log(
+        `OAuth callback server started on http://localhost:${CALLBACK_PORT}`,
+      );
+    });
+  });
+}
+
+/**
  * Creates and connects an MCP client to a server based on the provided configuration.
  * It determines the appropriate transport (Stdio, SSE, or Streamable HTTP) and
  * establishes a connection. It also applies a patch to handle request timeouts.
@@ -789,6 +905,7 @@ export async function connectToMcpServer(
   debugMode: boolean,
   workspaceContext: WorkspaceContext,
 ): Promise<Client> {
+  debugLogger.log(`Aashvi Connecting to MCP server '${mcpServerName}'...`);
   const mcpClient = new Client({
     name: 'gemini-cli-mcp-client',
     version: '0.0.1',
@@ -839,18 +956,60 @@ export async function connectToMcpServer(
     unlistenDirectories = undefined;
   };
 
+  debugLogger.log(`Aashvi2 Connecting to MCP server '${mcpServerName}'...`);
   try {
     const transport = await createTransport(
       mcpServerName,
       mcpServerConfig,
       debugMode,
     );
+    debugLogger.log(
+      `Aashvi3 done creating transport for MCP server '${mcpServerName}'...`,
+    );
     try {
+      debugLogger.log(`AAshvi4 Connecting to MCP server '${mcpServerName}'...`);
       await mcpClient.connect(transport, {
         timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
       });
+
+      debugLogger.log(`Aashvi5 Connected to MCP server '${mcpServerName}'`);
       return mcpClient;
     } catch (error) {
+      if (error instanceof UnauthorizedError) {
+        console.log('🔐 Aashvi OAuth required - waiting for authorization...');
+        const callbackPromise = waitForOAuthCallback();
+        const authCode = await callbackPromise;
+        console.log('🔐 Authorization code received:', authCode);
+
+        if (
+          transport &&
+          typeof (transport as StreamableHTTPClientTransport).finishAuth ===
+            'function'
+        ) {
+          await (transport as StreamableHTTPClientTransport).finishAuth(
+            authCode,
+          );
+
+          console.log('🔌 Reconnecting with authenticated transport...');
+
+          connectToMcpServer(
+            mcpServerName,
+            mcpServerConfig,
+            debugMode,
+            workspaceContext,
+          );
+          console.log('✅ Connected to MCP server after OAuth authentication');
+          return mcpClient;
+        } else {
+          throw new Error('Transport does not support finishAuth method');
+        }
+
+        // await this.attemptConnection(oauthProvider);
+      } else {
+        console.error('❌ Connection failed with non-auth error:', error);
+        throw error;
+      }
+
       await transport.close();
       throw error;
     }
@@ -870,6 +1029,7 @@ export async function connectToMcpServer(
         const credentials = await tokenStorage.getCredentials(mcpServerName);
         if (credentials) {
           const authProvider = new MCPOAuthProvider(tokenStorage);
+          debugLogger.log(`Aashvi-11 before getValidToken...`);
           const hasStoredTokens = await authProvider.getValidToken(
             mcpServerName,
             {
@@ -957,6 +1117,7 @@ export async function connectToMcpServer(
           const credentials = await tokenStorage.getCredentials(mcpServerName);
           if (credentials) {
             const authProvider = new MCPOAuthProvider(tokenStorage);
+            debugLogger.log(`Aashvi-6 before getValidToken...`);
             const accessToken = await authProvider.getValidToken(
               mcpServerName,
               {
@@ -1010,6 +1171,7 @@ export async function connectToMcpServer(
           const credentials = await tokenStorage.getCredentials(mcpServerName);
           if (credentials) {
             const authProvider = new MCPOAuthProvider(tokenStorage);
+            debugLogger.log(`Aashvi-7 before getValidToken...`);
             const hasStoredTokens = await authProvider.getValidToken(
               mcpServerName,
               {
@@ -1073,6 +1235,8 @@ export async function connectToMcpServer(
             const authProvider = new MCPOAuthProvider(
               new MCPOAuthTokenStorage(),
             );
+
+            debugLogger.log(`Aashvi-1 before authenticate...`);
             await authProvider.authenticate(
               mcpServerName,
               oauthAuthConfig,
@@ -1085,6 +1249,7 @@ export async function connectToMcpServer(
               await tokenStorage.getCredentials(mcpServerName);
             if (credentials) {
               const authProvider = new MCPOAuthProvider(tokenStorage);
+              debugLogger.log(`Aashvi-8 before getValidToken...`);
               const accessToken = await authProvider.getValidToken(
                 mcpServerName,
                 {
@@ -1215,11 +1380,12 @@ export async function createTransport(
 
   // Check if we have OAuth configuration or stored tokens
   let accessToken: string | null = null;
-  let hasOAuthConfig = mcpServerConfig.oauth?.enabled;
+  const hasOAuthConfig = mcpServerConfig.oauth?.enabled;
 
   if (hasOAuthConfig && mcpServerConfig.oauth) {
     const tokenStorage = new MCPOAuthTokenStorage();
     const authProvider = new MCPOAuthProvider(tokenStorage);
+    debugLogger.log(`Aashvi-9 before getValidToken...`);
     accessToken = await authProvider.getValidToken(
       mcpServerName,
       mcpServerConfig.oauth,
@@ -1232,27 +1398,63 @@ export async function createTransport(
       );
     }
   } else {
-    // Check if we have stored OAuth tokens for this server (from previous authentication)
-    const tokenStorage = new MCPOAuthTokenStorage();
-    const credentials = await tokenStorage.getCredentials(mcpServerName);
-    if (credentials) {
-      const authProvider = new MCPOAuthProvider(tokenStorage);
-      accessToken = await authProvider.getValidToken(mcpServerName, {
-        // Pass client ID if available
-        clientId: credentials.clientId,
-      });
+    debugLogger.log('Aashvi 5: Creating MCPOAuthClientProvider');
+    // const CALLBACK_PORT = 8090; // Use different port than auth server (3001)
+    //   const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/callback`;
 
-      if (accessToken) {
-        hasOAuthConfig = true;
-        debugLogger.log(
-          `Found stored OAuth token for server '${mcpServerName}'`,
-        );
-      }
-    }
+    //   const clientMetadata: OAuthClientMetadata = {
+    //         client_name: 'Simple OAuth MCP Client',
+    //         redirect_uris: [CALLBACK_URL],
+    //         grant_types: ['authorization_code', 'refresh_token'],
+    //         response_types: ['code'],
+    //         token_endpoint_auth_method: 'client_secret_post',
+    //         scope: 'mcp:tools'
+    //   };
+
+    //   const oauthProvider = new MCPOAuthClientProvider(CALLBACK_URL, clientMetadata, (redirectUrl: URL) => {
+    //         console.log(`📌 OAuth redirect handler called - opening browser`);
+    //         console.log(`Opening browser to: ${redirectUrl.toString()}`);
+    //         openBrowser(redirectUrl.toString());
+    //   });
+
+    debugLogger.log('Aashvi 6: Creating Streamable HTTP Transport');
+    const transportOptions: StreamableHTTPClientTransportOptions = {
+      authProvider: getSharedMcpOAuthClientProvider(),
+    };
+    return new StreamableHTTPClientTransport(
+      new URL(mcpServerConfig.httpUrl ?? mcpServerConfig.url!),
+      transportOptions,
+    );
   }
 
   if (mcpServerConfig.httpUrl) {
-    const transportOptions: StreamableHTTPClientTransportOptions = {};
+    debugLogger.log('Aashvi 5: Creating MCPOAuthClientProvider');
+    const CALLBACK_PORT = 8090; // Use different port than auth server (3001)
+    const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/callback`;
+
+    const clientMetadata: OAuthClientMetadata = {
+      client_name: 'Simple OAuth MCP Client',
+      redirect_uris: [CALLBACK_URL],
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'client_secret_post',
+      scope: 'mcp:tools',
+    };
+
+    const oauthProvider = new MCPOAuthClientProvider(
+      CALLBACK_URL,
+      clientMetadata,
+      (redirectUrl: URL) => {
+        console.log(`📌 OAuth redirect handler called - opening browser`);
+        console.log(`Opening browser to: ${redirectUrl.toString()}`);
+        openBrowser(redirectUrl.toString());
+      },
+    );
+
+    debugLogger.log('Aashvi 6: Creating Streamable HTTP Transport');
+    const transportOptions: StreamableHTTPClientTransportOptions = {
+      authProvider: oauthProvider,
+    };
 
     // Set up headers with OAuth token if available
     if (hasOAuthConfig && accessToken) {
