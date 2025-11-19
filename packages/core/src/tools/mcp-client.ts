@@ -43,7 +43,10 @@ import type {
   Unsubscribe,
   WorkspaceContext,
 } from '../utils/workspaceContext.js';
-import type { OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type {
+  OAuthClientMetadata,
+  OAuthClientInformation,
+} from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { ToolRegistry } from './tool-registry.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
@@ -1378,44 +1381,30 @@ export async function createTransport(
     throw new Error('No URL configured for Google Credentials MCP server');
   }
 
+  const accessToken: string | null = null;
   // Check if we have OAuth configuration or stored tokens
-  let accessToken: string | null = null;
+  //let accessToken: string | null = null;
   const hasOAuthConfig = mcpServerConfig.oauth?.enabled;
 
   if (hasOAuthConfig && mcpServerConfig.oauth) {
-    const tokenStorage = new MCPOAuthTokenStorage();
-    const authProvider = new MCPOAuthProvider(tokenStorage);
-    debugLogger.log(`Aashvi-9 before getValidToken...`);
-    accessToken = await authProvider.getValidToken(
-      mcpServerName,
-      mcpServerConfig.oauth,
-    );
+    debugLogger.log(`Aashvi 11 creating OAuth transport...`);
 
-    if (!accessToken) {
-      throw new Error(
-        `MCP server '${mcpServerName}' requires OAuth authentication. ` +
-          `Please authenticate using the /mcp auth command.`,
-      );
-    }
+    debugLogger.log('Aashvi 12: Creating Streamable HTTP Transport');
+    const oauthProvider = getSharedMcpOAuthClientProvider();
+    const clientInformation: OAuthClientInformation = {
+      client_id: mcpServerConfig.oauth.clientId!,
+      client_secret: mcpServerConfig.oauth.clientSecret!,
+    };
+    oauthProvider.saveClientInformation(clientInformation);
+    const transportOptions: StreamableHTTPClientTransportOptions = {
+      authProvider: oauthProvider,
+    };
+    return new StreamableHTTPClientTransport(
+      new URL(mcpServerConfig.httpUrl ?? mcpServerConfig.url!),
+      transportOptions,
+    );
   } else {
     debugLogger.log('Aashvi 5: Creating MCPOAuthClientProvider');
-    // const CALLBACK_PORT = 8090; // Use different port than auth server (3001)
-    //   const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/callback`;
-
-    //   const clientMetadata: OAuthClientMetadata = {
-    //         client_name: 'Simple OAuth MCP Client',
-    //         redirect_uris: [CALLBACK_URL],
-    //         grant_types: ['authorization_code', 'refresh_token'],
-    //         response_types: ['code'],
-    //         token_endpoint_auth_method: 'client_secret_post',
-    //         scope: 'mcp:tools'
-    //   };
-
-    //   const oauthProvider = new MCPOAuthClientProvider(CALLBACK_URL, clientMetadata, (redirectUrl: URL) => {
-    //         console.log(`📌 OAuth redirect handler called - opening browser`);
-    //         console.log(`Opening browser to: ${redirectUrl.toString()}`);
-    //         openBrowser(redirectUrl.toString());
-    //   });
 
     debugLogger.log('Aashvi 6: Creating Streamable HTTP Transport');
     const transportOptions: StreamableHTTPClientTransportOptions = {
@@ -1471,7 +1460,7 @@ export async function createTransport(
     }
 
     return new StreamableHTTPClientTransport(
-      new URL(mcpServerConfig.httpUrl),
+      new URL(mcpServerConfig.httpUrl ?? mcpServerConfig.url!),
       transportOptions,
     );
   }
@@ -1494,14 +1483,14 @@ export async function createTransport(
     }
 
     return new SSEClientTransport(
-      new URL(mcpServerConfig.url),
+      new URL(mcpServerConfig.url ?? mcpServerConfig.httpUrl!),
       transportOptions,
     );
   }
 
   if (mcpServerConfig.command) {
     const transport = new StdioClientTransport({
-      command: mcpServerConfig.command,
+      command: mcpServerConfig.command!,
       args: mcpServerConfig.args || [],
       env: {
         ...process.env,

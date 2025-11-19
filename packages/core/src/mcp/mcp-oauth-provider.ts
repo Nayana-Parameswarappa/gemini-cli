@@ -66,15 +66,17 @@ export class MCPOAuthClientProvider implements OAuthClientProvider {
   }
 
   clientInformation(): OAuthClientInformation | undefined {
+    debugLogger.log(`Aashvi1111 get client information`);
     return this._clientInformation;
   }
 
   saveClientInformation(clientInformation: OAuthClientInformation): void {
+    debugLogger.log(`Aashvi1111 save client information`);
     this._clientInformation = clientInformation;
   }
 
   tokens(): OAuthTokens | undefined {
-    debugLogger.log(`Aashvi1111 get tokens`);
+    debugLogger.log(`Aashvi1111 get tokens: ${JSON.stringify(this._tokens)}`);
     return this._tokens;
   }
 

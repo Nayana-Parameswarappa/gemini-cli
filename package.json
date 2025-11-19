@@ -119,6 +119,7 @@
     "yargs": "^17.7.2"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "file:../typescript-sdk",
     "latest-version": "^9.0.0",
     "simple-git": "^3.28.0"
   },
