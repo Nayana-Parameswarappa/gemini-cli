@@ -93,22 +93,10 @@ const authCommand: SlashCommand = {
         Date.now(),
       );
 
-      // Import dynamically to avoid circular dependencies
-      const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
-
       let oauthConfig = server.oauth;
       if (!oauthConfig) {
         oauthConfig = { enabled: false };
       }
-
-      const mcpServerUrl = server.httpUrl || server.url;
-      const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-      await authProvider.authenticate(
-        serverName,
-        oauthConfig,
-        mcpServerUrl,
-        appEvents,
-      );
 
       context.ui.addItem(
         {

@@ -906,29 +906,36 @@ export async function connectToMcpServer(
       return mcpClient;
     } catch (error) {
       if (error instanceof UnauthorizedError) {
-        debugLogger.log(
-          '🔐 Aashvi Waiting for authorization response from browser..',
-        );
-
         const callbackPromise = waitForOAuthCallback(generateStateParam());
         const authCode = await callbackPromise;
-        debugLogger.log('🔐 Aashvi Authorization code received:', authCode);
 
         if (
           transport instanceof StreamableHTTPClientTransport &&
           typeof (transport as StreamableHTTPClientTransport).finishAuth ===
             'function'
         ) {
+          // Complete the OAuth flow with the authorization code
           await (transport as StreamableHTTPClientTransport).finishAuth(
             authCode,
           );
-          console.log('🔌 Reconnecting with authenticated transport...');
 
-          // try to re-open the same client connection with the now-authenticated transport
-          await mcpClient.connect(transport, {
+          // Close the old transport after finishAuth completes
+          try {
+            await transport.close();
+          } catch {
+            // Ignore errors closing the transport
+          }
+
+          // Create a fresh transport - the auth provider now has valid tokens
+          const newTransport = await createTransport(
+            mcpServerName,
+            mcpServerConfig,
+            debugMode,
+          );
+
+          await mcpClient.connect(newTransport, {
             timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
           });
-          console.log('✅ Connected to MCP server after OAuth authentication');
           return mcpClient;
         } else {
           throw new Error('Transport does not support finishAuth method');
@@ -1047,6 +1054,11 @@ interface NamedTool {
 let cachedState: string | undefined;
 
 /**
+ * Cached OAuth provider instance per server
+ */
+let cachedOAuthProvider: MCPOAuthClientProvider | undefined;
+
+/**
  * Generate PKCE parameters for OAuth flow.
  *
  * @returns PKCE state parameters
@@ -1063,8 +1075,12 @@ export function generateStateParam(): string {
 export async function getMcpOAuthClientProvider(
   mcpServerConfig: MCPServerConfig,
 ): Promise<MCPOAuthClientProvider> {
+  // Return cached provider if it exists
+  if (cachedOAuthProvider) {
+    return cachedOAuthProvider;
+  }
+
   const state = generateStateParam();
-  console.log('🔐 Aashvi creating callback server..');
 
   const clientMetadata: OAuthClientMetadata = {
     client_name: 'Simple OAuth MCP Client',
@@ -1075,7 +1091,7 @@ export async function getMcpOAuthClientProvider(
     scope: mcpServerConfig.oauth?.scopes?.join(' ') || 'openid profile email',
   };
 
-  return new MCPOAuthClientProvider(
+  cachedOAuthProvider = new MCPOAuthClientProvider(
     CALLBACK_URL,
     clientMetadata,
     state,
@@ -1084,6 +1100,8 @@ export async function getMcpOAuthClientProvider(
       openBrowser(authUrl.toString());
     },
   );
+
+  return cachedOAuthProvider;
 }
 
 async function waitForOAuthCallback(expectedState: string): Promise<string> {

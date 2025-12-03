@@ -11,8 +11,6 @@ import type {
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
-import { debugLogger } from '../utils/debugLogger.js';
-
 export const OAUTH_DISPLAY_MESSAGE_EVENT = 'oauth-display-message' as const;
 
 /**
@@ -76,22 +74,18 @@ export class MCPOAuthClientProvider implements OAuthClientProvider {
   }
 
   clientInformation(): OAuthClientInformation | undefined {
-    debugLogger.log(`Aashvi1111 get client information`);
     return this._clientInformation;
   }
 
   saveClientInformation(clientInformation: OAuthClientInformation): void {
-    debugLogger.log(`Aashvi1111 save client information`);
     this._clientInformation = clientInformation;
   }
 
   tokens(): OAuthTokens | undefined {
-    debugLogger.log(`Aashvi1111 get tokens: ${JSON.stringify(this._tokens)}`);
     return this._tokens;
   }
 
   saveTokens(tokens: OAuthTokens): void {
-    debugLogger.log(`Aashvi1111 Saving tokens: ${JSON.stringify(tokens)}`);
     this._tokens = tokens;
   }
 
