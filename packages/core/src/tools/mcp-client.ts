@@ -377,17 +377,15 @@ async function createUrlTransport(
     | SSEClientTransportOptions,
 ): Promise<StreamableHTTPClientTransport | SSEClientTransport> {
   if (mcpServerConfig.httpUrl) {
-    // If authProvider wasn't provided (e.g. service account or google creds
-    // aren't configured), attempt to use the interactive OAuth client provider.
-    if (!transportOptions.authProvider) {
+    // If authProvider wasn't provided and OAuth is configured,
+    // set up the interactive OAuth client provider.
+    if (!transportOptions.authProvider && mcpServerConfig.oauth) {
       const oauthProvider = await getMcpOAuthClientProvider(mcpServerConfig);
-      if (mcpServerConfig.oauth) {
-        const clientInformation: OAuthClientInformation = {
-          client_id: mcpServerConfig.oauth.clientId!,
-          client_secret: mcpServerConfig.oauth.clientSecret!,
-        };
-        oauthProvider.saveClientInformation(clientInformation);
-      }
+      const clientInformation: OAuthClientInformation = {
+        client_id: mcpServerConfig.oauth.clientId!,
+        client_secret: mcpServerConfig.oauth.clientSecret!,
+      };
+      oauthProvider.saveClientInformation(clientInformation);
       transportOptions.authProvider = oauthProvider;
     }
     return new StreamableHTTPClientTransport(
@@ -906,6 +904,14 @@ export async function connectToMcpServer(
       return mcpClient;
     } catch (error) {
       if (error instanceof UnauthorizedError) {
+        // Set up OAuth provider if not already configured
+        if (!mcpServerConfig.oauth) {
+          // For now, we need OAuth configuration to handle UnauthorizedError
+          throw new Error(
+            'OAuth authentication required but no OAuth configuration provided',
+          );
+        }
+
         const callbackPromise = waitForOAuthCallback(generateStateParam());
         const authCode = await callbackPromise;
 
