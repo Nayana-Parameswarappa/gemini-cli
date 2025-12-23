@@ -1650,6 +1650,8 @@ describe('connectToMcpServer with OAuth', () => {
     };
     vi.mocked(MCPOAuthClientProvider).mockReturnValue(
       mockOAuthProvider as unknown as ReturnType<typeof MCPOAuthClientProvider>,
+
+      mockOAuthProvider as unknown as ReturnType<typeof MCPOAuthClientProvider>,
     );
 
     // First connection attempt succeeds

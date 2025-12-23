@@ -40,7 +40,6 @@ import { ServiceAccountImpersonationProvider } from '../mcp/sa-impersonation-pro
 import { DiscoveredMCPTool } from './mcp-tool.js';
 
 import { createServer } from 'node:http';
-import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { CallableTool, FunctionCall, Part, Tool } from '@google/genai';
 import { basename } from 'node:path';
@@ -1125,24 +1124,6 @@ async function connectWithSSETransport(
 }
 
 /**
- * Helper function to show authentication required message and throw error.
- * Checks if there's a stored token that was rejected (requires re-auth).
- *
- * @param serverName The name of the MCP server
- * @throws Always throws an error with authentication instructions
- */
-async function _showAuthRequiredMessage(serverName: string): Promise<never> {
-  const hasRejectedToken = !!(await getStoredOAuthToken(serverName));
-
-  const message = hasRejectedToken
-    ? `MCP server '${serverName}' rejected stored OAuth token. Please re-authenticate using: /mcp auth ${serverName}`
-    : `MCP server '${serverName}' requires authentication using: /mcp auth ${serverName}`;
-
-  coreEvents.emitFeedback('info', message);
-  throw new UnauthorizedError(message);
-}
-
-/**
  * Creates and connects an MCP client to a server based on the provided configuration.
  * It determines the appropriate transport (Stdio, SSE, or Streamable HTTP) and
  * establishes a connection. It also applies a patch to handle request timeouts.
@@ -1261,6 +1242,7 @@ export async function connectToMcpServer(
             mcpServerName,
             mcpServerConfig,
             debugMode,
+            sanitizationConfig,
           );
 
           await mcpClient.connect(newTransport, {
