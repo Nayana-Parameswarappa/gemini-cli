@@ -1649,9 +1649,8 @@ describe('connectToMcpServer with OAuth', () => {
       getAccessToken: vi.fn().mockResolvedValue('test-access-token'),
     };
     vi.mocked(MCPOAuthClientProvider).mockReturnValue(
-      mockOAuthProvider as unknown as ReturnType<typeof MCPOAuthClientProvider>,
-
-      mockOAuthProvider as unknown as ReturnType<typeof MCPOAuthClientProvider>,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockOAuthProvider as any,
     );
 
     // First connection attempt succeeds
@@ -1702,7 +1701,8 @@ describe('connectToMcpServer - HTTP→SSE fallback', () => {
       isTokenExpired: vi.fn().mockReturnValue(false),
     };
     vi.mocked(MCPOAuthTokenStorage).mockReturnValue(
-      mockTokenStorage as unknown as ReturnType<typeof MCPOAuthTokenStorage>,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockTokenStorage as any,
     );
   });
 
@@ -1857,7 +1857,8 @@ describe('connectToMcpServer - OAuth with transport fallback', () => {
       getAccessToken: vi.fn().mockResolvedValue('test-access-token'),
     };
     vi.mocked(MCPOAuthClientProvider).mockReturnValue(
-      mockOAuthProvider as unknown as ReturnType<typeof MCPOAuthClientProvider>,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockOAuthProvider as any,
     );
   });
 
