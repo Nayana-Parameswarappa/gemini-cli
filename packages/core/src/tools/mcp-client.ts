@@ -11,6 +11,7 @@ import type {
   JsonSchemaType,
   JsonSchemaValidator,
 } from '@modelcontextprotocol/sdk/validation/types.js';
+import { MCPOAuthClientProvider } from '../mcp/mcp-oauth-provider.js';
 import type { SSEClientTransportOptions } from '@modelcontextprotocol/sdk/client/sse.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -38,23 +39,27 @@ import { GoogleCredentialProvider } from '../mcp/google-auth-provider.js';
 import { ServiceAccountImpersonationProvider } from '../mcp/sa-impersonation-provider.js';
 import { DiscoveredMCPTool } from './mcp-tool.js';
 
+import { createServer } from 'node:http';
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { CallableTool, FunctionCall, Part, Tool } from '@google/genai';
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { McpAuthProvider } from '../mcp/auth-provider.js';
-import { MCPOAuthProvider } from '../mcp/oauth-provider.js';
 import { MCPOAuthTokenStorage } from '../mcp/oauth-token-storage.js';
-import { OAuthUtils } from '../mcp/oauth-utils.js';
 import type { PromptRegistry } from '../prompts/prompt-registry.js';
-import {
-  getErrorMessage,
-  isAuthenticationError,
-  UnauthorizedError,
-} from '../utils/errors.js';
+import { getErrorMessage, isAuthenticationError } from '../utils/errors.js';
 import type {
   Unsubscribe,
   WorkspaceContext,
 } from '../utils/workspaceContext.js';
+import { exec } from 'node:child_process';
+import type {
+  OAuthClientInformation,
+  OAuthClientMetadata,
+} from '@modelcontextprotocol/sdk/shared/auth.js';
+import { URL } from 'node:url';
+import * as crypto from 'node:crypto';
 import type { ToolRegistry } from './tool-registry.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
@@ -66,11 +71,21 @@ import {
 } from '../services/environmentSanitization.js';
 
 export const MCP_DEFAULT_TIMEOUT_MSEC = 10 * 60 * 1000; // default to 10 minutes
+const CALLBACK_PORT = 8090;
+const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/callback`;
 
 export type DiscoveredMCPPrompt = Prompt & {
   serverName: string;
   invoke: (params: Record<string, unknown>) => Promise<GetPromptResult>;
 };
+
+/**
+ * OAuth authorization response.
+ */
+export interface OAuthAuthorizationResponse {
+  code: string;
+  state: string;
+}
 
 /**
  * Enum representing the connection status of an MCP server
@@ -467,6 +482,14 @@ let mcpDiscoveryState: MCPDiscoveryState = MCPDiscoveryState.NOT_STARTED;
 export const mcpServerRequiresOAuth: Map<string, boolean> = new Map();
 
 /**
+ * Cache of OAuth client providers per MCP server.
+ * Key: MCP server name
+ * Value: MCPOAuthClientProvider instance
+ */
+export const mcpOAuthClientProviders: Map<string, MCPOAuthClientProvider> =
+  new Map();
+
+/**
  * Event listeners for MCP server status changes
  */
 type StatusChangeListener = (
@@ -532,104 +555,6 @@ export function getMCPDiscoveryState(): MCPDiscoveryState {
 }
 
 /**
- * Extract WWW-Authenticate header from error message string.
- * This is a more robust approach than regex matching.
- *
- * @param errorString The error message string
- * @returns The www-authenticate header value if found, null otherwise
- */
-function extractWWWAuthenticateHeader(errorString: string): string | null {
-  // Try multiple patterns to extract the header
-  const patterns = [
-    /www-authenticate:\s*([^\n\r]+)/i,
-    /WWW-Authenticate:\s*([^\n\r]+)/i,
-    /"www-authenticate":\s*"([^"]+)"/i,
-    /'www-authenticate':\s*'([^']+)'/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = errorString.match(pattern);
-    if (match) {
-      return match[1].trim();
-    }
-  }
-
-  return null;
-}
-
-/**
- * Handle automatic OAuth discovery and authentication for a server.
- *
- * @param mcpServerName The name of the MCP server
- * @param mcpServerConfig The MCP server configuration
- * @param wwwAuthenticate The www-authenticate header value
- * @returns True if OAuth was successfully configured and authenticated, false otherwise
- */
-async function handleAutomaticOAuth(
-  mcpServerName: string,
-  mcpServerConfig: MCPServerConfig,
-  wwwAuthenticate: string,
-): Promise<boolean> {
-  try {
-    debugLogger.log(`🔐 '${mcpServerName}' requires OAuth authentication`);
-
-    // Always try to parse the resource metadata URI from the www-authenticate header
-    let oauthConfig;
-    const resourceMetadataUri =
-      OAuthUtils.parseWWWAuthenticateHeader(wwwAuthenticate);
-    if (resourceMetadataUri) {
-      oauthConfig = await OAuthUtils.discoverOAuthConfig(resourceMetadataUri);
-    } else if (hasNetworkTransport(mcpServerConfig)) {
-      // Fallback: try to discover OAuth config from the base URL
-      const serverUrl = new URL(
-        mcpServerConfig.httpUrl || mcpServerConfig.url!,
-      );
-      const baseUrl = `${serverUrl.protocol}//${serverUrl.host}`;
-      oauthConfig = await OAuthUtils.discoverOAuthConfig(baseUrl);
-    }
-
-    if (!oauthConfig) {
-      coreEvents.emitFeedback(
-        'error',
-        `Could not configure OAuth for '${mcpServerName}' - please authenticate manually with /mcp auth ${mcpServerName}`,
-      );
-      return false;
-    }
-
-    // OAuth configuration discovered - proceed with authentication
-
-    // Create OAuth configuration for authentication
-    const oauthAuthConfig = {
-      enabled: true,
-      authorizationUrl: oauthConfig.authorizationUrl,
-      tokenUrl: oauthConfig.tokenUrl,
-      scopes: oauthConfig.scopes || [],
-    };
-
-    // Perform OAuth authentication
-    // Pass the server URL for proper discovery
-    const serverUrl = mcpServerConfig.httpUrl || mcpServerConfig.url;
-    debugLogger.log(
-      `Starting OAuth authentication for server '${mcpServerName}'...`,
-    );
-    const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-    await authProvider.authenticate(mcpServerName, oauthAuthConfig, serverUrl);
-
-    debugLogger.log(
-      `OAuth authentication successful for server '${mcpServerName}'`,
-    );
-    return true;
-  } catch (error) {
-    coreEvents.emitFeedback(
-      'error',
-      `Failed to handle automatic OAuth for server '${mcpServerName}': ${getErrorMessage(error)}`,
-      error,
-    );
-    return false;
-  }
-}
-
-/**
  * Create RequestInit for TransportOptions.
  *
  * @param mcpServerConfig The MCP server configuration
@@ -667,40 +592,6 @@ function createAuthProvider(
     return new GoogleCredentialProvider(mcpServerConfig);
   }
   return undefined;
-}
-
-/**
- * Create a transport with OAuth token for the given server configuration.
- *
- * @param mcpServerName The name of the MCP server
- * @param mcpServerConfig The MCP server configuration
- * @param accessToken The OAuth access token
- * @returns The transport with OAuth token, or null if creation fails
- */
-async function createTransportWithOAuth(
-  mcpServerName: string,
-  mcpServerConfig: MCPServerConfig,
-  accessToken: string,
-): Promise<StreamableHTTPClientTransport | SSEClientTransport | null> {
-  try {
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${accessToken}`,
-    };
-    const transportOptions:
-      | StreamableHTTPClientTransportOptions
-      | SSEClientTransportOptions = {
-      requestInit: createTransportRequestInit(mcpServerConfig, headers),
-    };
-
-    return createUrlTransport(mcpServerName, mcpServerConfig, transportOptions);
-  } catch (error) {
-    coreEvents.emitFeedback(
-      'error',
-      `Failed to create OAuth transport for server '${mcpServerName}': ${getErrorMessage(error)}`,
-      error,
-    );
-    return null;
-  }
 }
 
 /**
@@ -1171,22 +1062,24 @@ export function hasNetworkTransport(config: MCPServerConfig): boolean {
 }
 
 /**
- * Helper function to retrieve a stored OAuth token for an MCP server.
- * Handles token validation and refresh automatically.
+ * Helper function to get a stored OAuth token for a server.
+ * This is used when attempting SSE fallback with OAuth authentication.
+ * Note: This returns the stored token without refreshing it if expired.
  *
  * @param serverName The name of the MCP server
- * @returns The valid access token, or null if no token is stored
+ * @returns The access token if stored and not expired, or null otherwise
  */
 async function getStoredOAuthToken(serverName: string): Promise<string | null> {
   const tokenStorage = new MCPOAuthTokenStorage();
   const credentials = await tokenStorage.getCredentials(serverName);
-  if (!credentials) return null;
+  if (!credentials || !credentials.token) return null;
 
-  const authProvider = new MCPOAuthProvider(tokenStorage);
-  return authProvider.getValidToken(serverName, {
-    // Pass client ID if available
-    clientId: credentials.clientId,
-  });
+  // Check if token is expired
+  if (tokenStorage.isTokenExpired(credentials.token)) {
+    return null;
+  }
+
+  return credentials.token.accessToken;
 }
 
 /**
@@ -1238,7 +1131,7 @@ async function connectWithSSETransport(
  * @param serverName The name of the MCP server
  * @throws Always throws an error with authentication instructions
  */
-async function showAuthRequiredMessage(serverName: string): Promise<never> {
+async function _showAuthRequiredMessage(serverName: string): Promise<never> {
   const hasRejectedToken = !!(await getStoredOAuthToken(serverName));
 
   const message = hasRejectedToken
@@ -1247,77 +1140,6 @@ async function showAuthRequiredMessage(serverName: string): Promise<never> {
 
   coreEvents.emitFeedback('info', message);
   throw new UnauthorizedError(message);
-}
-
-/**
- * Helper function to retry connection with OAuth token after authentication.
- * Handles both HTTP and SSE transports based on what previously failed.
- *
- * @param client The MCP client to connect
- * @param serverName The name of the MCP server
- * @param config The MCP server configuration
- * @param accessToken The OAuth access token to use
- * @param httpReturned404 Whether the HTTP transport returned 404 (indicating SSE-only server)
- */
-async function retryWithOAuth(
-  client: Client,
-  serverName: string,
-  config: MCPServerConfig,
-  accessToken: string,
-  httpReturned404: boolean,
-): Promise<void> {
-  if (httpReturned404) {
-    // HTTP returned 404, only try SSE
-    debugLogger.log(
-      `Retrying SSE connection to '${serverName}' with OAuth token...`,
-    );
-    await connectWithSSETransport(client, config, accessToken);
-    debugLogger.log(
-      `Successfully connected to '${serverName}' using SSE with OAuth.`,
-    );
-    return;
-  }
-
-  // HTTP returned 401, try HTTP with OAuth first
-  debugLogger.log(`Retrying connection to '${serverName}' with OAuth token...`);
-
-  const httpTransport = await createTransportWithOAuth(
-    serverName,
-    config,
-    accessToken,
-  );
-  if (!httpTransport) {
-    throw new Error(
-      `Failed to create OAuth transport for server '${serverName}'`,
-    );
-  }
-
-  try {
-    await client.connect(httpTransport, {
-      timeout: config.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
-    });
-    debugLogger.log(
-      `Successfully connected to '${serverName}' using HTTP with OAuth.`,
-    );
-  } catch (httpError) {
-    await httpTransport.close();
-
-    // If HTTP+OAuth returns 404 and auto-detection enabled, try SSE+OAuth
-    if (
-      String(httpError).includes('404') &&
-      config.url &&
-      !config.type &&
-      !config.httpUrl
-    ) {
-      debugLogger.log(`HTTP with OAuth returned 404, trying SSE with OAuth...`);
-      await connectWithSSETransport(client, config, accessToken);
-      debugLogger.log(
-        `Successfully connected to '${serverName}' using SSE with OAuth.`,
-      );
-    } else {
-      throw httpError;
-    }
-  }
 }
 
 /**
@@ -1410,18 +1232,60 @@ export async function connectToMcpServer(
       });
       return mcpClient;
     } catch (error) {
-      await transport.close();
-      firstAttemptError = error as Error;
-      throw error;
+      firstAttemptError =
+        error instanceof Error ? error : new Error(String(error));
+      if (
+        isAuthenticationError(error) &&
+        hasNetworkTransport(mcpServerConfig)
+      ) {
+        mcpServerRequiresOAuth.set(mcpServerName, true);
+        const callbackPromise = waitForOAuthCallback(generateStateParam());
+        const authCode = await callbackPromise;
+
+        if (
+          transport instanceof StreamableHTTPClientTransport &&
+          typeof transport.finishAuth === 'function'
+        ) {
+          // Complete the OAuth flow with the authorization code
+          await transport.finishAuth(authCode);
+
+          // Close the old transport after finishAuth completes
+          try {
+            await transport.close();
+          } catch {
+            throw error;
+          }
+
+          // Create a fresh transport - the auth provider now has valid tokens
+          const newTransport = await createTransport(
+            mcpServerName,
+            mcpServerConfig,
+            debugMode,
+          );
+
+          await mcpClient.connect(newTransport, {
+            timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
+          });
+          return mcpClient;
+        } else {
+          throw new Error('Transport does not support finishAuth method');
+        }
+      } else {
+        console.error('❌ Connection failed with non-auth error:', error);
+        if (transport) {
+          try {
+            await transport.close();
+          } catch {
+            throw error;
+          }
+        }
+        throw error;
+      }
     }
   } catch (initialError) {
     let error = initialError;
 
-    // Check if this is a 401 error FIRST (before attempting SSE fallback)
-    // This ensures OAuth flow happens before we try SSE
-    if (isAuthenticationError(error) && hasNetworkTransport(mcpServerConfig)) {
-      // Continue to OAuth handling below (after SSE fallback section)
-    } else if (
+    if (
       // If not 401, and HTTP failed with url without explicit type, try SSE fallback
       firstAttemptError &&
       mcpServerConfig.url &&
@@ -1468,212 +1332,31 @@ export async function connectToMcpServer(
           throw firstAttemptError;
         }
       }
-    }
-
-    // Check if this is a 401 error that might indicate OAuth is required
-    if (isAuthenticationError(error) && hasNetworkTransport(mcpServerConfig)) {
-      mcpServerRequiresOAuth.set(mcpServerName, true);
-
-      // Only trigger automatic OAuth if explicitly enabled in config
-      // Otherwise, show error and tell user to run /mcp auth command
-      const shouldTriggerOAuth = mcpServerConfig.oauth?.enabled;
-
-      if (!shouldTriggerOAuth) {
-        await showAuthRequiredMessage(mcpServerName);
-      }
-
-      // Try to extract www-authenticate header from the error
-      const errorString = String(error);
-      let wwwAuthenticate = extractWWWAuthenticateHeader(errorString);
-
-      // If we didn't get the header from the error string, try to get it from the server
-      if (!wwwAuthenticate && hasNetworkTransport(mcpServerConfig)) {
-        debugLogger.log(
-          `No www-authenticate header in error, trying to fetch it from server...`,
-        );
-        try {
-          const urlToFetch = mcpServerConfig.httpUrl || mcpServerConfig.url!;
-
-          // Determine correct Accept header based on what transport failed
-          let acceptHeader: string;
-          if (mcpServerConfig.httpUrl) {
-            acceptHeader = 'application/json';
-          } else if (mcpServerConfig.type === 'http') {
-            acceptHeader = 'application/json';
-          } else if (mcpServerConfig.type === 'sse') {
-            acceptHeader = 'text/event-stream';
-          } else if (httpReturned404) {
-            // HTTP failed with 404, SSE returned 401 - use SSE header
-            acceptHeader = 'text/event-stream';
-          } else {
-            // HTTP returned 401 - use HTTP header
-            acceptHeader = 'application/json';
-          }
-
-          const response = await fetch(urlToFetch, {
-            method: 'HEAD',
-            headers: {
-              Accept: acceptHeader,
-            },
-            signal: AbortSignal.timeout(5000),
-          });
-
-          if (response.status === 401) {
-            wwwAuthenticate = response.headers.get('www-authenticate');
-            if (wwwAuthenticate) {
-              debugLogger.log(
-                `Found www-authenticate header from server: ${wwwAuthenticate}`,
-              );
-            }
-          }
-        } catch (fetchError) {
-          debugLogger.debug(
-            `Failed to fetch www-authenticate header: ${getErrorMessage(
-              fetchError,
-            )}`,
-          );
-        }
-      }
-
-      if (wwwAuthenticate) {
-        debugLogger.log(
-          `Received 401 with www-authenticate header: ${wwwAuthenticate}`,
-        );
-
-        // Try automatic OAuth discovery and authentication
-        const oauthSuccess = await handleAutomaticOAuth(
-          mcpServerName,
-          mcpServerConfig,
-          wwwAuthenticate,
-        );
-        if (oauthSuccess) {
-          // Retry connection with OAuth token
-          const accessToken = await getStoredOAuthToken(mcpServerName);
-          if (!accessToken) {
-            throw new Error(
-              `Failed to get OAuth token for server '${mcpServerName}'`,
-            );
-          }
-
-          await retryWithOAuth(
-            mcpClient,
-            mcpServerName,
-            mcpServerConfig,
-            accessToken,
-            httpReturned404,
-          );
-          return mcpClient;
-        } else {
-          throw new Error(
-            `Failed to handle automatic OAuth for server '${mcpServerName}'`,
-          );
-        }
-      } else {
-        // No www-authenticate header found, but we got a 401
-        // Only try OAuth discovery when OAuth is explicitly enabled in config
-        const shouldTryDiscovery = mcpServerConfig.oauth?.enabled;
-
-        if (!shouldTryDiscovery) {
-          await showAuthRequiredMessage(mcpServerName);
-        }
-
-        // For SSE/HTTP servers, try to discover OAuth configuration from the base URL
-        debugLogger.log(
-          `🔍 Attempting OAuth discovery for '${mcpServerName}'...`,
-        );
-
-        if (hasNetworkTransport(mcpServerConfig)) {
-          const serverUrl = new URL(
-            mcpServerConfig.httpUrl || mcpServerConfig.url!,
-          );
-          const baseUrl = `${serverUrl.protocol}//${serverUrl.host}`;
-
-          // Try to discover OAuth configuration from the base URL
-          const oauthConfig = await OAuthUtils.discoverOAuthConfig(baseUrl);
-          if (oauthConfig) {
-            debugLogger.log(
-              `Discovered OAuth configuration from base URL for server '${mcpServerName}'`,
-            );
-
-            // Create OAuth configuration for authentication
-            const oauthAuthConfig = {
-              enabled: true,
-              authorizationUrl: oauthConfig.authorizationUrl,
-              tokenUrl: oauthConfig.tokenUrl,
-              scopes: oauthConfig.scopes || [],
-            };
-
-            // Perform OAuth authentication
-            // Pass the server URL for proper discovery
-            const authServerUrl =
-              mcpServerConfig.httpUrl || mcpServerConfig.url;
-            debugLogger.log(
-              `Starting OAuth authentication for server '${mcpServerName}'...`,
-            );
-            const authProvider = new MCPOAuthProvider(
-              new MCPOAuthTokenStorage(),
-            );
-            await authProvider.authenticate(
-              mcpServerName,
-              oauthAuthConfig,
-              authServerUrl,
-            );
-
-            // Retry connection with OAuth token
-            const accessToken = await getStoredOAuthToken(mcpServerName);
-            if (!accessToken) {
-              throw new Error(
-                `Failed to get OAuth token for server '${mcpServerName}'`,
-              );
-            }
-
-            // Create transport with OAuth token
-            const oauthTransport = await createTransportWithOAuth(
-              mcpServerName,
-              mcpServerConfig,
-              accessToken,
-            );
-            if (!oauthTransport) {
-              throw new Error(
-                `Failed to create OAuth transport for server '${mcpServerName}'`,
-              );
-            }
-
-            await mcpClient.connect(oauthTransport, {
-              timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
-            });
-            // Connection successful with OAuth
-            return mcpClient;
-          } else {
-            throw new Error(
-              `OAuth configuration failed for '${mcpServerName}'. Please authenticate manually with /mcp auth ${mcpServerName}`,
-            );
-          }
-        } else {
-          throw new Error(
-            `MCP server '${mcpServerName}' requires authentication. Please configure OAuth or check server settings.`,
-          );
-        }
-      }
+    } else if (firstAttemptError) {
+      // Error occurred but doesn't meet SSE fallback criteria (e.g., explicit type set)
+      // Re-throw the original error
+      throw firstAttemptError;
     } else {
-      // Handle other connection errors
-      // Re-throw the original error to preserve its structure
+      // This should never happen, but if we get here without firstAttemptError, throw initialError
       throw error;
     }
   }
+
+  // This should never be reached, but TypeScript requires a return statement
+  throw new Error('Unexpected end of connectToMcpServer function');
 }
 
 /**
  * Helper function to create the appropriate transport based on config
  * This handles the logic for httpUrl/url/type consistently
  */
-function createUrlTransport(
+async function createUrlTransport(
   mcpServerName: string,
   mcpServerConfig: MCPServerConfig,
   transportOptions:
     | StreamableHTTPClientTransportOptions
     | SSEClientTransportOptions,
-): StreamableHTTPClientTransport | SSEClientTransport {
+): Promise<StreamableHTTPClientTransport | SSEClientTransport> {
   // Priority 1: httpUrl (deprecated)
   if (mcpServerConfig.httpUrl) {
     if (mcpServerConfig.url) {
@@ -1681,6 +1364,20 @@ function createUrlTransport(
         `MCP server '${mcpServerName}': Both 'httpUrl' and 'url' are configured. ` +
           `Using deprecated 'httpUrl'. Please migrate to 'url' with 'type: "http"'.`,
       );
+    }
+    if (!transportOptions.authProvider) {
+      const oauthProvider = await getMcpOAuthClientProvider(mcpServerConfig);
+      if (
+        mcpServerConfig.oauth?.clientId &&
+        mcpServerConfig.oauth?.clientSecret
+      ) {
+        const clientInformation: OAuthClientInformation = {
+          client_id: mcpServerConfig.oauth.clientId,
+          client_secret: mcpServerConfig.oauth.clientSecret,
+        };
+        oauthProvider.saveClientInformation(clientInformation);
+      }
+      transportOptions.authProvider = oauthProvider;
     }
     return new StreamableHTTPClientTransport(
       new URL(mcpServerConfig.httpUrl),
@@ -1744,38 +1441,6 @@ export async function createTransport(
     const headers: Record<string, string> =
       (await authProvider?.getRequestHeaders?.()) ?? {};
 
-    if (authProvider === undefined) {
-      // Check if we have OAuth configuration or stored tokens
-      let accessToken: string | null = null;
-      if (mcpServerConfig.oauth?.enabled && mcpServerConfig.oauth) {
-        const tokenStorage = new MCPOAuthTokenStorage();
-        const mcpAuthProvider = new MCPOAuthProvider(tokenStorage);
-        accessToken = await mcpAuthProvider.getValidToken(
-          mcpServerName,
-          mcpServerConfig.oauth,
-        );
-
-        if (!accessToken) {
-          // Emit info message (not error) since this is expected behavior
-          coreEvents.emitFeedback(
-            'info',
-            `MCP server '${mcpServerName}' requires authentication using: /mcp auth ${mcpServerName}`,
-          );
-        }
-      } else {
-        // Check if we have stored OAuth tokens for this server (from previous authentication)
-        accessToken = await getStoredOAuthToken(mcpServerName);
-        if (accessToken) {
-          debugLogger.log(
-            `Found stored OAuth token for server '${mcpServerName}'`,
-          );
-        }
-      }
-      if (accessToken) {
-        headers['Authorization'] = `Bearer ${accessToken}`;
-      }
-    }
-
     const transportOptions:
       | StreamableHTTPClientTransportOptions
       | SSEClientTransportOptions = {
@@ -1816,6 +1481,182 @@ export async function createTransport(
 
 interface NamedTool {
   name?: string;
+}
+
+/**
+ * Cached state value for OAuth flow
+ */
+let cachedState: string | undefined;
+
+/**
+ * Cached OAuth provider instance per server
+ */
+let cachedOAuthProvider: MCPOAuthClientProvider | undefined;
+
+/**
+ * Generate PKCE parameters for OAuth flow.
+ *
+ * @returns PKCE state parameters
+ */
+export function generateStateParam(): string {
+  if (cachedState) {
+    return cachedState;
+  }
+  // Generate state for CSRF protection
+  cachedState = crypto.randomBytes(16).toString('base64url');
+  return cachedState;
+}
+
+export async function getMcpOAuthClientProvider(
+  mcpServerConfig: MCPServerConfig,
+): Promise<MCPOAuthClientProvider> {
+  // Return cached provider if it exists
+  if (cachedOAuthProvider) {
+    return cachedOAuthProvider;
+  }
+
+  const state = generateStateParam();
+
+  const clientMetadata: OAuthClientMetadata = {
+    client_name: 'Simple OAuth MCP Client',
+    redirect_uris: [CALLBACK_URL],
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'],
+    token_endpoint_auth_method: 'client_secret_post',
+    scope: mcpServerConfig.oauth?.scopes?.join(' ') || 'openid profile email',
+  };
+
+  cachedOAuthProvider = new MCPOAuthClientProvider(
+    CALLBACK_URL,
+    clientMetadata,
+    state,
+    (authUrl: URL) => {
+      console.log(`📌 OAuth redirect handler called - opening browser`);
+      void openBrowser(authUrl.toString());
+    },
+  );
+
+  return cachedOAuthProvider;
+}
+
+async function waitForOAuthCallback(expectedState: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
+      // Ignore favicon requests
+      if (req.url === '/favicon.ico') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      console.log(`📥 Received callback: ${req.url}`);
+      const parsedUrl = new URL(req.url || '', 'http://localhost');
+      const code = parsedUrl.searchParams.get('code');
+      const error = parsedUrl.searchParams.get('error');
+      const state = parsedUrl.searchParams.get('state');
+
+      // --- 1. Authorization Error (Provider-side Failure) ---
+      if (error) {
+        console.log(`❌ Authorization error: ${error}`);
+        res.writeHead(400, { 'Content-Type': 'text/html' });
+        res.end(`
+                    <html>
+                      <body>
+                        <h1>Authorization Failed</h1>
+                        <p>Error: ${error}</p>
+                      </body>
+                    </html>
+                `);
+        server.close(); // 🛑 Close server on authorization error
+        reject(new Error(`OAuth authorization failed: ${error}`));
+        return;
+      }
+
+      // --- 2. Missing Parameters ---
+      if (!code || !state) {
+        console.log(
+          `❌ Missing required parameters (code=${!!code}, state=${!!state})`,
+        );
+        res.writeHead(400);
+        res.end('Missing authorization code or state parameter');
+        server.close(); // 🛑 Close server on missing parameters
+        reject(new Error('Missing required OAuth parameters'));
+        return;
+      }
+
+      // --- 3. State Validation (CSRF Protection) ---
+      if (state !== expectedState) {
+        console.log(
+          `⚠️ State mismatch! Expected: ${expectedState}, Received: ${state}`,
+        );
+        res.writeHead(400, { 'Content-Type': 'text/html' });
+        res.end(`
+                    <html>
+                      <body>
+                        <h1>Authorization Failed (Security Error)</h1>
+                        <p>Invalid state parameter. Possible Cross-Site Request Forgery (CSRF) attempt.</p>
+                      </body>
+                    </html>
+                `);
+        server.close(); // 🛑 Close server on state mismatch
+        reject(new Error('State mismatch - possible CSRF attack'));
+        return;
+      }
+
+      // --- 4. Success Path ---
+      console.log(
+        `✅ Authorization code received: ${code.substring(0, 10)}...`,
+      );
+
+      // Send success response to the browser
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`
+                <html>
+                  <body>
+                    <h1>Authorization Successful!</h1>
+                    <p>You can close this window and return to the terminal.</p>
+                    <script>setTimeout(() => window.close(), 2000);</script>
+                  </body>
+                </html>
+            `);
+
+      // Resolve the promise
+      resolve(code);
+
+      // Close the server on success (after a slight delay to ensure the response is sent)
+      setTimeout(() => server.close(), 3000);
+    };
+
+    const server = createServer(requestHandler);
+
+    server
+      .listen(CALLBACK_PORT, () => {
+        console.log(
+          `OAuth callback server started on http://localhost:${CALLBACK_PORT}`,
+        );
+      })
+      .on('error', (err: NodeJS.ErrnoException) => {
+        // Handle server creation/listening errors (e.g., port in use)
+        // The promise is rejected, and the application must handle cleanup if needed.
+        reject(new Error(`Server listening failed: ${err.message}`));
+      });
+  });
+}
+
+/**
+ * Opens the authorization URL in the user's default browser
+ */
+async function openBrowser(url: string): Promise<void> {
+  console.log(`🌐 Opening browser for authorization: ${url}`);
+
+  const command = `open "${url}"`;
+
+  exec(command, (error) => {
+    if (error) {
+      console.error(`Failed to open browser: ${error.message}`);
+      console.log(`Please manually open: ${url}`);
+    }
+  });
 }
 
 /** Visible for testing */

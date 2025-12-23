@@ -195,6 +195,7 @@ export class McpClientManager {
             this.eventEmitter?.emit('mcp-client-update', this.clients);
           }
           try {
+            debugLogger.log(`Discovering tools from MCP server '${name}'...`);
             await client.connect();
             await client.discover(this.cliConfig);
             this.eventEmitter?.emit('mcp-client-update', this.clients);
