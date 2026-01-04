@@ -876,6 +876,7 @@ class McpCallableTool implements CallableTool {
     const call = functionCalls[0];
 
     try {
+      console.log(`🔧 Calling MCP tool: ${call.name} with args:`, call.args);
       const result = await this.client.callTool(
         {
           name: call.name!,
@@ -885,6 +886,7 @@ class McpCallableTool implements CallableTool {
         { timeout: this.timeout },
       );
 
+      console.log(`✅ MCP tool ${call.name} returned:`, result);
       return [
         {
           functionResponse: {
@@ -894,6 +896,8 @@ class McpCallableTool implements CallableTool {
         },
       ];
     } catch (error) {
+      console.error(`❌ Error calling MCP tool ${call.name}:`, error);
+      debugLogger.error('AAshvi Error calling MCP tool:', error);
       // Return error in the format expected by DiscoveredMCPTool
       return [
         {
@@ -1207,62 +1211,78 @@ export async function connectToMcpServer(
       debugMode,
       sanitizationConfig,
     );
+
+    // If this is a network transport with OAuth, set up callback handling
+    if (
+      hasNetworkTransport(mcpServerConfig) &&
+      transport instanceof StreamableHTTPClientTransport &&
+      typeof transport.finishAuth === 'function'
+    ) {
+      debugLogger.log('🌐 Setting up OAuth callback handler...');
+      const callbackPromise = waitForOAuthCallback(generateStateParam());
+
+      // Start connection attempt - this might trigger OAuth flow
+      const connectPromise = mcpClient.connect(transport, {
+        timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
+      });
+
+      // Race connection against OAuth callback
+      // If OAuth is triggered, callback will resolve first
+      try {
+        await Promise.race([
+          connectPromise,
+          callbackPromise.then(async (authCode) => {
+            debugLogger.log('🔐 Received auth code, calling finishAuth...');
+            await transport.finishAuth(authCode);
+            debugLogger.log('✅ finishAuth completed');
+            // After finishAuth, let the connect promise complete
+            return connectPromise;
+          }),
+        ]);
+
+        debugLogger.log('✅ Connection successful!');
+
+        // Save tokens after successful connection
+        const oauthProvider = await getMcpOAuthClientProvider(mcpServerConfig);
+        const sdkTokens = oauthProvider.tokens();
+        if (sdkTokens) {
+          debugLogger.log('💾 Saving OAuth tokens to persistent storage...');
+          const tokenStorage = new MCPOAuthTokenStorage();
+          const expiresAt = Date.now() + (sdkTokens.expires_in || 3600) * 1000;
+          await tokenStorage.setCredentials({
+            serverName: mcpServerName,
+            token: {
+              accessToken: sdkTokens.access_token,
+              tokenType: sdkTokens.token_type,
+              refreshToken: sdkTokens.refresh_token,
+              scope: sdkTokens.scope,
+              expiresAt,
+            },
+            updatedAt: Date.now(),
+          });
+          debugLogger.log('✅ Tokens saved to storage');
+        }
+
+        return mcpClient;
+      } catch (error) {
+        debugLogger.log('❌ Connection/OAuth flow failed:', error);
+        throw error;
+      }
+    }
+
+    // Non-OAuth path (stdio, or already authenticated)
     try {
+      debugLogger.log('🔌 Attempting to connect to MCP server...');
       await mcpClient.connect(transport, {
         timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
       });
+      debugLogger.log('✅ Connected successfully!');
       return mcpClient;
     } catch (error) {
+      debugLogger.log('❌ Connection attempt failed:', error);
       firstAttemptError =
         error instanceof Error ? error : new Error(String(error));
-      if (
-        isAuthenticationError(error) &&
-        hasNetworkTransport(mcpServerConfig)
-      ) {
-        mcpServerRequiresOAuth.set(mcpServerName, true);
-        const callbackPromise = waitForOAuthCallback(generateStateParam());
-        const authCode = await callbackPromise;
-
-        if (
-          transport instanceof StreamableHTTPClientTransport &&
-          typeof transport.finishAuth === 'function'
-        ) {
-          // Complete the OAuth flow with the authorization code
-          await transport.finishAuth(authCode);
-
-          // Close the old transport after finishAuth completes
-          try {
-            await transport.close();
-          } catch {
-            throw error;
-          }
-
-          // Create a fresh transport - the auth provider now has valid tokens
-          const newTransport = await createTransport(
-            mcpServerName,
-            mcpServerConfig,
-            debugMode,
-            sanitizationConfig,
-          );
-
-          await mcpClient.connect(newTransport, {
-            timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
-          });
-          return mcpClient;
-        } else {
-          throw new Error('Transport does not support finishAuth method');
-        }
-      } else {
-        console.error('❌ Connection failed with non-auth error:', error);
-        if (transport) {
-          try {
-            await transport.close();
-          } catch {
-            throw error;
-          }
-        }
-        throw error;
-      }
+      // Fall through to SSE fallback handling below
     }
   } catch (initialError) {
     let error = initialError;
