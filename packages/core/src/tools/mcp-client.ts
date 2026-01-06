@@ -876,7 +876,10 @@ class McpCallableTool implements CallableTool {
     const call = functionCalls[0];
 
     try {
-      console.log(`🔧 Calling MCP tool: ${call.name} with args:`, call.args);
+      debugLogger.log(
+        `🔧 Calling MCP tool: ${call.name} with args:`,
+        call.args,
+      );
       const result = await this.client.callTool(
         {
           name: call.name!,
@@ -886,7 +889,7 @@ class McpCallableTool implements CallableTool {
         { timeout: this.timeout },
       );
 
-      console.log(`✅ MCP tool ${call.name} returned:`, result);
+      debugLogger.log(`✅ MCP tool ${call.name} returned:`, result);
       return [
         {
           functionResponse: {
@@ -896,8 +899,85 @@ class McpCallableTool implements CallableTool {
         },
       ];
     } catch (error) {
-      console.error(`❌ Error calling MCP tool ${call.name}:`, error);
-      debugLogger.error('AAshvi Error calling MCP tool:', error);
+      // Check if this is an OAuth unauthorized error
+      const isUnauthorized =
+        error instanceof Error &&
+        (error.message === 'Unauthorized' ||
+          error.message.includes('Unauthorized'));
+
+      if (isUnauthorized && pendingCallbackResolve) {
+        debugLogger.log(
+          '⚠️ Unauthorized error detected - OAuth flow may be in progress',
+        );
+        debugLogger.log('⏳ Waiting for OAuth callback to complete...');
+
+        try {
+          // Wait for the OAuth flow to complete (with timeout)
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              reject(new Error('OAuth callback timeout'));
+            }, 30000); // 30 second timeout
+
+            // Check every 100ms if the callback has completed
+            const checkInterval = setInterval(() => {
+              if (!pendingCallbackResolve) {
+                clearTimeout(timeout);
+                clearInterval(checkInterval);
+                resolve();
+              }
+            }, 100);
+          });
+
+          debugLogger.log('🔄 OAuth flow completed - retrying tool call...');
+
+          // Retry the tool call now that we have tokens
+          const result = await this.client.callTool(
+            {
+              name: call.name!,
+              arguments: call.args as Record<string, unknown>,
+            },
+            undefined,
+            { timeout: this.timeout },
+          );
+
+          debugLogger.log(
+            `✅ MCP tool ${call.name} succeeded on retry:`,
+            result,
+          );
+          return [
+            {
+              functionResponse: {
+                name: call.name,
+                response: result,
+              },
+            },
+          ];
+        } catch (retryError) {
+          debugLogger.error(
+            `❌ Retry failed for MCP tool ${call.name}:`,
+            retryError,
+          );
+          // Return the retry error (which has more context) instead of the original Unauthorized error
+          return [
+            {
+              functionResponse: {
+                name: call.name,
+                response: {
+                  error: {
+                    message:
+                      retryError instanceof Error
+                        ? retryError.message
+                        : String(retryError),
+                    isError: true,
+                  },
+                },
+              },
+            },
+          ];
+        }
+      }
+
+      debugLogger.error(`❌ Error calling MCP tool ${call.name}:`, error);
       // Return error in the format expected by DiscoveredMCPTool
       return [
         {
@@ -1212,37 +1292,23 @@ export async function connectToMcpServer(
       sanitizationConfig,
     );
 
-    // If this is a network transport with OAuth, set up callback handling
+    // If this is a network transport with OAuth, just connect normally
+    // The SDK will handle OAuth automatically if the server returns 401
     if (
       hasNetworkTransport(mcpServerConfig) &&
       transport instanceof StreamableHTTPClientTransport &&
       typeof transport.finishAuth === 'function'
     ) {
-      debugLogger.log('🌐 Setting up OAuth callback handler...');
-      const callbackPromise = waitForOAuthCallback(generateStateParam());
+      debugLogger.log('🔌 Connecting to OAuth-enabled MCP server...');
 
-      // Start connection attempt - this might trigger OAuth flow
-      const connectPromise = mcpClient.connect(transport, {
-        timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
-      });
-
-      // Race connection against OAuth callback
-      // If OAuth is triggered, callback will resolve first
       try {
-        await Promise.race([
-          connectPromise,
-          callbackPromise.then(async (authCode) => {
-            debugLogger.log('🔐 Received auth code, calling finishAuth...');
-            await transport.finishAuth(authCode);
-            debugLogger.log('✅ finishAuth completed');
-            // After finishAuth, let the connect promise complete
-            return connectPromise;
-          }),
-        ]);
+        await mcpClient.connect(transport, {
+          timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
+        });
 
         debugLogger.log('✅ Connection successful!');
 
-        // Save tokens after successful connection
+        // Save tokens after successful connection if available
         const oauthProvider = await getMcpOAuthClientProvider(mcpServerConfig);
         const sdkTokens = oauthProvider.tokens();
         if (sdkTokens) {
@@ -1265,7 +1331,7 @@ export async function connectToMcpServer(
 
         return mcpClient;
       } catch (error) {
-        debugLogger.log('❌ Connection/OAuth flow failed:', error);
+        debugLogger.log('❌ Connection failed:', error);
         throw error;
       }
     }
@@ -1368,6 +1434,7 @@ async function createUrlTransport(
       );
     }
     if (!transportOptions.authProvider) {
+      debugLogger.log('🔧 Creating OAuth provider for httpUrl transport');
       const oauthProvider = await getMcpOAuthClientProvider(mcpServerConfig);
       if (
         mcpServerConfig.oauth?.clientId &&
@@ -1380,20 +1447,38 @@ async function createUrlTransport(
         oauthProvider.saveClientInformation(clientInformation);
       }
       transportOptions.authProvider = oauthProvider;
+      debugLogger.log('✅ OAuth provider created and set');
     }
-    return new StreamableHTTPClientTransport(
+    const transport = new StreamableHTTPClientTransport(
       new URL(mcpServerConfig.httpUrl),
       transportOptions,
     );
+    // Track OAuth transport for callback handling
+    debugLogger.log(
+      '🔍 Checking if authProvider is MCPOAuthClientProvider:',
+      transportOptions.authProvider instanceof MCPOAuthClientProvider,
+    );
+    if (transportOptions.authProvider instanceof MCPOAuthClientProvider) {
+      debugLogger.log('✅ Setting activeOAuthTransport for httpUrl');
+      activeOAuthTransport = transport;
+    } else {
+      debugLogger.log('⚠️ authProvider is NOT MCPOAuthClientProvider');
+    }
+    return transport;
   }
 
   // Priority 2 & 3: url with explicit type
   if (mcpServerConfig.url && mcpServerConfig.type) {
     if (mcpServerConfig.type === 'http') {
-      return new StreamableHTTPClientTransport(
+      const transport = new StreamableHTTPClientTransport(
         new URL(mcpServerConfig.url),
         transportOptions,
       );
+      // Track OAuth transport for callback handling
+      if (transportOptions.authProvider instanceof MCPOAuthClientProvider) {
+        activeOAuthTransport = transport;
+      }
+      return transport;
     } else if (mcpServerConfig.type === 'sse') {
       return new SSEClientTransport(
         new URL(mcpServerConfig.url),
@@ -1404,10 +1489,15 @@ async function createUrlTransport(
 
   // Priority 4: url without type (default to HTTP)
   if (mcpServerConfig.url) {
-    return new StreamableHTTPClientTransport(
+    const transport = new StreamableHTTPClientTransport(
       new URL(mcpServerConfig.url),
       transportOptions,
     );
+    // Track OAuth transport for callback handling
+    if (transportOptions.authProvider instanceof MCPOAuthClientProvider) {
+      activeOAuthTransport = transport;
+    }
+    return transport;
   }
 
   throw new Error(`No URL configured for MCP server '${mcpServerName}'`);
@@ -1496,6 +1586,161 @@ let cachedState: string | undefined;
 let cachedOAuthProvider: MCPOAuthClientProvider | undefined;
 
 /**
+ * Persistent OAuth callback server that stays running
+ */
+let persistentCallbackServer: ReturnType<typeof createServer> | undefined;
+let pendingCallbackResolve: ((code: string) => void) | undefined;
+let pendingCallbackReject: ((error: Error) => void) | undefined;
+
+/**
+ * Active transport for finishAuth callback
+ */
+let activeOAuthTransport: StreamableHTTPClientTransport | undefined;
+
+/**
+ * Start persistent callback server if not already running
+ */
+function startPersistentCallbackServer(): void {
+  if (persistentCallbackServer) {
+    return; // Already running
+  }
+
+  debugLogger.log(
+    '🌐 Starting persistent OAuth callback server on port 8090...',
+  );
+
+  persistentCallbackServer = createServer(
+    async (req: IncomingMessage, res: ServerResponse) => {
+      if (req.url === '/favicon.ico') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      debugLogger.log(`📥 Received OAuth callback: ${req.url}`);
+      const parsedUrl = new URL(req.url || '', 'http://localhost');
+      const code = parsedUrl.searchParams.get('code');
+      const error = parsedUrl.searchParams.get('error');
+
+      if (error) {
+        debugLogger.log(`❌ Authorization error: ${error}`);
+        res.writeHead(400, { 'Content-Type': 'text/html' });
+        res.end(`
+        <html>
+          <body>
+            <h1>Authorization Failed</h1>
+            <p>Error: ${error}</p>
+          </body>
+        </html>
+      `);
+        if (pendingCallbackReject) {
+          pendingCallbackReject(
+            new Error(`OAuth authorization failed: ${error}`),
+          );
+          pendingCallbackResolve = undefined;
+          pendingCallbackReject = undefined;
+        }
+        return;
+      }
+
+      if (!code) {
+        debugLogger.log('❌ Missing authorization code');
+        res.writeHead(400);
+        res.end('Missing authorization code');
+        return;
+      }
+
+      debugLogger.log(
+        `✅ Authorization code received: ${code.substring(0, 10)}...`,
+      );
+
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`
+      <html>
+        <body>
+          <h1>Authorization Successful!</h1>
+          <p>You can close this window and return to the terminal.</p>
+          <script>setTimeout(() => window.close(), 2000);</script>
+        </body>
+      </html>
+    `);
+
+      // Call finishAuth on the active transport to complete OAuth flow
+      // MUST await finishAuth before resolving callback to ensure tokens are exchanged
+      debugLogger.log(
+        '🔍 activeOAuthTransport defined?',
+        !!activeOAuthTransport,
+      );
+      debugLogger.log(
+        '🔍 finishAuth exists?',
+        activeOAuthTransport &&
+          typeof activeOAuthTransport.finishAuth === 'function',
+      );
+      if (
+        activeOAuthTransport &&
+        typeof activeOAuthTransport.finishAuth === 'function'
+      ) {
+        debugLogger.log(
+          '🔐 Calling finishAuth on transport with code:',
+          code.substring(0, 10) + '...',
+        );
+        try {
+          await activeOAuthTransport.finishAuth(code);
+          debugLogger.log('✅ OAuth flow completed - tokens exchanged');
+
+          // Check if provider has tokens now
+          if (cachedOAuthProvider) {
+            const tokens = cachedOAuthProvider.tokens();
+            debugLogger.log('🔍 Provider tokens after finishAuth:', {
+              hasAccessToken: !!tokens?.access_token,
+              hasRefreshToken: !!tokens?.refresh_token,
+              expiresIn: tokens?.expires_in,
+              tokenType: tokens?.token_type,
+            });
+          } else {
+            debugLogger.log('⚠️ cachedOAuthProvider is undefined');
+          }
+        } catch (err) {
+          debugLogger.error('❌ finishAuth failed:', err);
+          if (pendingCallbackReject) {
+            pendingCallbackReject(err as Error);
+            pendingCallbackResolve = undefined;
+            pendingCallbackReject = undefined;
+          }
+          return;
+        }
+      } else {
+        debugLogger.log('⚠️ Cannot call finishAuth - transport not available');
+        debugLogger.log('⚠️ activeOAuthTransport:', activeOAuthTransport);
+      }
+
+      if (pendingCallbackResolve) {
+        pendingCallbackResolve(code);
+        pendingCallbackResolve = undefined;
+        pendingCallbackReject = undefined;
+      }
+    },
+  );
+
+  persistentCallbackServer
+    .listen(CALLBACK_PORT, () => {
+      console.log(
+        `✅ Persistent OAuth callback server running on http://localhost:${CALLBACK_PORT}`,
+      );
+    })
+    .on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        console.log(
+          `⚠️ Port ${CALLBACK_PORT} already in use - callback server may already be running`,
+        );
+        // Don't fail - server might already be running from a previous instance
+      } else {
+        console.error(`❌ Failed to start callback server: ${err.message}`);
+      }
+    });
+}
+
+/**
  * Generate PKCE parameters for OAuth flow.
  *
  * @returns PKCE state parameters
@@ -1517,6 +1762,9 @@ export async function getMcpOAuthClientProvider(
     return cachedOAuthProvider;
   }
 
+  // Start persistent callback server
+  startPersistentCallbackServer();
+
   const state = generateStateParam();
 
   const clientMetadata: OAuthClientMetadata = {
@@ -1532,117 +1780,42 @@ export async function getMcpOAuthClientProvider(
     CALLBACK_URL,
     clientMetadata,
     state,
-    (authUrl: URL) => {
-      console.log(`📌 OAuth redirect handler called - opening browser`);
+    async (authUrl: URL) => {
+      debugLogger.log(
+        `📌 OAuth flow triggered - opening browser (non-blocking)`,
+      );
+      debugLogger.log(`🔗 Auth URL: ${authUrl.toString()}`);
+
+      // Set up promise to wait for callback (runs in background)
+      const callbackPromise = new Promise<string>((resolve, reject) => {
+        pendingCallbackResolve = resolve;
+        pendingCallbackReject = reject;
+      });
+
+      // Open browser and handle callback in background
       void openBrowser(authUrl.toString());
+
+      // Handle callback asynchronously (don't block redirectToAuthorization)
+      void callbackPromise.then(() => {
+        debugLogger.log(
+          '🔐 Background: Authorization code received and finishAuth completed',
+        );
+        const tokens = cachedOAuthProvider?.tokens();
+        debugLogger.log('🔍 Background: Provider tokens after callback:', {
+          hasTokens: !!tokens,
+          hasAccessToken: !!tokens?.access_token,
+          hasRefreshToken: !!tokens?.refresh_token,
+        });
+      });
+
+      // Return immediately - don't wait for callback
+      debugLogger.log(
+        '↩️ redirectToAuthorization returning immediately (callback will complete in background)',
+      );
     },
   );
 
   return cachedOAuthProvider;
-}
-
-async function waitForOAuthCallback(expectedState: string): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
-      // Ignore favicon requests
-      if (req.url === '/favicon.ico') {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
-
-      console.log(`📥 Received callback: ${req.url}`);
-      const parsedUrl = new URL(req.url || '', 'http://localhost');
-      const code = parsedUrl.searchParams.get('code');
-      const error = parsedUrl.searchParams.get('error');
-      const state = parsedUrl.searchParams.get('state');
-
-      // --- 1. Authorization Error (Provider-side Failure) ---
-      if (error) {
-        console.log(`❌ Authorization error: ${error}`);
-        res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(`
-                    <html>
-                      <body>
-                        <h1>Authorization Failed</h1>
-                        <p>Error: ${error}</p>
-                      </body>
-                    </html>
-                `);
-        server.close(); // 🛑 Close server on authorization error
-        reject(new Error(`OAuth authorization failed: ${error}`));
-        return;
-      }
-
-      // --- 2. Missing Parameters ---
-      if (!code || !state) {
-        console.log(
-          `❌ Missing required parameters (code=${!!code}, state=${!!state})`,
-        );
-        res.writeHead(400);
-        res.end('Missing authorization code or state parameter');
-        server.close(); // 🛑 Close server on missing parameters
-        reject(new Error('Missing required OAuth parameters'));
-        return;
-      }
-
-      // --- 3. State Validation (CSRF Protection) ---
-      if (state !== expectedState) {
-        console.log(
-          `⚠️ State mismatch! Expected: ${expectedState}, Received: ${state}`,
-        );
-        res.writeHead(400, { 'Content-Type': 'text/html' });
-        res.end(`
-                    <html>
-                      <body>
-                        <h1>Authorization Failed (Security Error)</h1>
-                        <p>Invalid state parameter. Possible Cross-Site Request Forgery (CSRF) attempt.</p>
-                      </body>
-                    </html>
-                `);
-        server.close(); // 🛑 Close server on state mismatch
-        reject(new Error('State mismatch - possible CSRF attack'));
-        return;
-      }
-
-      // --- 4. Success Path ---
-      console.log(
-        `✅ Authorization code received: ${code.substring(0, 10)}...`,
-      );
-
-      // Send success response to the browser
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(`
-                <html>
-                  <body>
-                    <h1>Authorization Successful!</h1>
-                    <p>You can close this window and return to the terminal.</p>
-                    <script>setTimeout(() => window.close(), 2000);</script>
-                  </body>
-                </html>
-            `);
-
-      // Resolve the promise
-      resolve(code);
-
-      // Close the server on success (after a slight delay to ensure the response is sent)
-      setTimeout(() => server.close(), 3000);
-    };
-
-    const server = createServer(requestHandler);
-
-    server
-      .listen(CALLBACK_PORT, () => {
-        console.log(
-          `OAuth callback server started on http://localhost:${CALLBACK_PORT}`,
-        );
-      })
-      .on('error', (err: NodeJS.ErrnoException) => {
-        // Handle server creation/listening errors (e.g., port in use)
-        // The promise is rejected, and the application must handle cleanup if needed.
-        reject(new Error(`Server listening failed: ${err.message}`));
-      });
-  });
 }
 
 /**
