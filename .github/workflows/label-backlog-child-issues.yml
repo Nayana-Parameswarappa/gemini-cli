@@ -2,33 +2,56 @@ name: 'Label Child Issues for Project Rollup'
 
 on:
   issues:
-    types: ['opened', 'edited']
+    types: ['opened', 'edited', 'reopened']
+  schedule:
+    - cron: '0 * * * *' # Run every hour
+  workflow_dispatch:
+
+permissions:
+  issues: 'write'
+  contents: 'read'
 
 jobs:
+  # Event-based: Quick reaction to new/edited issues in THIS repo
   labeler:
+    if: "github.event_name == 'issues'"
     runs-on: 'ubuntu-latest'
-    permissions:
-      issues: 'write'
     steps:
-      - name: 'Check for Parent Workstream and Apply Label'
-        uses: 'actions/github-script@v7'
-        with:
-          script: |
-            const issue = context.payload.issue;
-            // Define the parent workstream issue numbers
-            const parentWorkstreamNumbers = [15374, 15456, 15324];
-            // Define the label to add
-            const labelToAdd = "workstream-rollup";
+      - name: 'Checkout'
+        uses: 'actions/checkout@v4'
 
-            // Check if the issue has a body and a parent, and if that parent is in our list
-            if (issue && issue.body && issue.parent && parentWorkstreamNumbers.includes(issue.parent.number)) {
-              console.log(`Issue #${issue.number} is a child of a target workstream. Adding label.`);
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                labels: [labelToAdd]
-              });
-            } else {
-              console.log(`Issue #${issue.number} is not a valid child of a target workstream or has no body. No action taken.`);
-            }
+      - name: 'Setup Node.js'
+        uses: 'actions/setup-node@v4'
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 'Install Dependencies'
+        run: 'npm ci'
+
+      - name: 'Run Multi-Repo Sync Script'
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: 'node .github/scripts/sync-maintainer-labels.cjs'
+
+  # Scheduled/Manual: Recursive sync across multiple repos
+  sync-maintainer-labels:
+    if: "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@v4'
+
+      - name: 'Setup Node.js'
+        uses: 'actions/setup-node@v4'
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 'Install Dependencies'
+        run: 'npm ci'
+
+      - name: 'Run Multi-Repo Sync Script'
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: 'node .github/scripts/sync-maintainer-labels.cjs'

@@ -19,11 +19,12 @@ import { SettingsContext } from '../contexts/SettingsContext.js';
 vi.mock('../contexts/VimModeContext.js', () => ({
   useVimMode: vi.fn(() => ({
     vimEnabled: false,
-    vimMode: 'NORMAL',
+    vimMode: 'INSERT',
   })),
 }));
 import { ApprovalMode } from '@google/gemini-cli-core';
 import { StreamingState } from '../types.js';
+import { mergeSettings } from '../../config/settings.js';
 
 // Mock child components
 vi.mock('./LoadingIndicator.js', () => ({
@@ -40,8 +41,8 @@ vi.mock('./HookStatusDisplay.js', () => ({
   HookStatusDisplay: () => <Text>HookStatusDisplay</Text>,
 }));
 
-vi.mock('./AutoAcceptIndicator.js', () => ({
-  AutoAcceptIndicator: () => <Text>AutoAcceptIndicator</Text>,
+vi.mock('./ApprovalModeIndicator.js', () => ({
+  ApprovalModeIndicator: () => <Text>ApprovalModeIndicator</Text>,
 }));
 
 vi.mock('./ShellModeIndicator.js', () => ({
@@ -53,7 +54,9 @@ vi.mock('./DetailedMessagesDisplay.js', () => ({
 }));
 
 vi.mock('./InputPrompt.js', () => ({
-  InputPrompt: () => <Text>InputPrompt</Text>,
+  InputPrompt: ({ placeholder }: { placeholder?: string }) => (
+    <Text>InputPrompt: {placeholder}</Text>
+  ),
   calculatePromptWidths: vi.fn(() => ({
     inputWidth: 80,
     suggestionsWidth: 40,
@@ -94,12 +97,12 @@ const createMockUIState = (overrides: Partial<UIState> = {}): UIState =>
   ({
     streamingState: null,
     contextFileNames: [],
-    showAutoAcceptIndicator: ApprovalMode.DEFAULT,
+    showApprovalModeIndicator: ApprovalMode.DEFAULT,
     messageQueue: [],
     showErrorDetails: false,
     constrainHeight: false,
     isInputActive: true,
-    buffer: '',
+    buffer: { text: '' },
     inputWidth: 80,
     suggestionsWidth: 40,
     userMessages: [],
@@ -154,6 +157,7 @@ const createMockConfig = (overrides = {}) => ({
   }),
   getSkillManager: () => ({
     getSkills: () => [],
+    getDisplayableSkills: () => [],
   }),
   getMcpClientManager: () => ({
     getMcpServers: () => ({}),
@@ -162,13 +166,20 @@ const createMockConfig = (overrides = {}) => ({
   ...overrides,
 });
 
-const createMockSettings = (merged = {}) => ({
-  merged: {
-    hideFooter: false,
-    showMemoryUsage: false,
-    ...merged,
-  },
-});
+const createMockSettings = (merged = {}) => {
+  const defaultMergedSettings = mergeSettings({}, {}, {}, {}, true);
+  return {
+    merged: {
+      ...defaultMergedSettings,
+      ui: {
+        ...defaultMergedSettings.ui,
+        hideFooter: false,
+        showMemoryUsage: false,
+        ...merged,
+      },
+    },
+  };
+};
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const renderComposer = (
@@ -274,7 +285,7 @@ describe('Composer', () => {
         thought: { subject: 'Hidden', description: 'Should not show' },
       });
       const config = createMockConfig({
-        getAccessibility: vi.fn(() => ({ disableLoadingPhrases: true })),
+        getAccessibility: vi.fn(() => ({ enableLoadingPhrases: false })),
       });
 
       const { lastFrame } = renderComposer(uiState, undefined, config);
@@ -380,11 +391,12 @@ describe('Composer', () => {
     it('shows escape prompt when showEscapePrompt is true', () => {
       const uiState = createMockUIState({
         showEscapePrompt: true,
+        history: [{ id: 1, type: 'user', text: 'test' }],
       });
 
       const { lastFrame } = renderComposer(uiState);
 
-      expect(lastFrame()).toContain('Press Esc again to clear');
+      expect(lastFrame()).toContain('Press Esc again to rewind');
     });
   });
 
@@ -409,15 +421,15 @@ describe('Composer', () => {
       expect(lastFrame()).not.toContain('InputPrompt');
     });
 
-    it('shows AutoAcceptIndicator when approval mode is not default and shell mode is inactive', () => {
+    it('shows ApprovalModeIndicator when approval mode is not default and shell mode is inactive', () => {
       const uiState = createMockUIState({
-        showAutoAcceptIndicator: ApprovalMode.YOLO,
+        showApprovalModeIndicator: ApprovalMode.YOLO,
         shellModeActive: false,
       });
 
       const { lastFrame } = renderComposer(uiState);
 
-      expect(lastFrame()).toContain('AutoAcceptIndicator');
+      expect(lastFrame()).toContain('ApprovalModeIndicator');
     });
 
     it('shows ShellModeIndicator when shell mode is active', () => {
@@ -475,6 +487,42 @@ describe('Composer', () => {
       const { lastFrame } = renderComposer(uiState);
 
       expect(lastFrame()).not.toContain('DetailedMessagesDisplay');
+    });
+  });
+
+  describe('Vim Mode Placeholders', () => {
+    it('shows correct placeholder in INSERT mode', async () => {
+      const uiState = createMockUIState({ isInputActive: true });
+      const { useVimMode } = await import('../contexts/VimModeContext.js');
+      vi.mocked(useVimMode).mockReturnValue({
+        vimEnabled: true,
+        vimMode: 'INSERT',
+        toggleVimEnabled: vi.fn(),
+        setVimMode: vi.fn(),
+      });
+
+      const { lastFrame } = renderComposer(uiState);
+
+      expect(lastFrame()).toContain(
+        "InputPrompt:   Press 'Esc' for NORMAL mode.",
+      );
+    });
+
+    it('shows correct placeholder in NORMAL mode', async () => {
+      const uiState = createMockUIState({ isInputActive: true });
+      const { useVimMode } = await import('../contexts/VimModeContext.js');
+      vi.mocked(useVimMode).mockReturnValue({
+        vimEnabled: true,
+        vimMode: 'NORMAL',
+        toggleVimEnabled: vi.fn(),
+        setVimMode: vi.fn(),
+      });
+
+      const { lastFrame } = renderComposer(uiState);
+
+      expect(lastFrame()).toContain(
+        "InputPrompt:   Press 'i' for INSERT mode.",
+      );
     });
   });
 });
