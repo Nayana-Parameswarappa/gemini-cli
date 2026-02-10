@@ -20,9 +20,17 @@ import {
   getErrorMessage,
   MCPOAuthTokenStorage,
   mcpServerRequiresOAuth,
+  CoreEvent,
+  coreEvents,
 } from '@google/gemini-cli-core';
-import { appEvents, AppEvent } from '../../utils/events.js';
+
 import { MessageType, type HistoryItemMcpStatus } from '../types.js';
+import {
+  McpServerEnablementManager,
+  normalizeServerId,
+  canLoadServer,
+} from '../../config/mcp/mcpServerEnablement.js';
+import { loadSettings } from '../../config/settings.js';
 
 const authCommand: SlashCommand = {
   name: 'auth',
@@ -87,61 +95,41 @@ const authCommand: SlashCommand = {
       };
     }
 
-    // Always attempt OAuth authentication, even if not explicitly configured
-    // The authentication process will discover OAuth requirements automatically
-
     const displayListener = (message: string) => {
-      context.ui.addItem({ type: 'info', text: message }, Date.now());
+      context.ui.addItem({ type: 'info', text: message });
     };
 
-    appEvents.on(AppEvent.OauthDisplayMessage, displayListener);
-
+    coreEvents.on(CoreEvent.OauthDisplayMessage, displayListener);
     try {
-      context.ui.addItem(
-        {
-          type: 'info',
-          text: `Starting OAuth authentication for MCP server '${serverName}'...`,
-        },
-        Date.now(),
-      );
+      context.ui.addItem({
+        type: 'info',
+        text: `Starting OAuth authentication for MCP server '${serverName}'...`,
+      });
 
-      // Import dynamically to avoid circular dependencies
-      const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
-
-      let oauthConfig = server.oauth;
-      if (!oauthConfig) {
-        oauthConfig = { enabled: false };
-      }
-
-      const mcpServerUrl = server.httpUrl || server.url;
-      const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-      await authProvider.authenticate(
-        serverName,
-        oauthConfig,
-        mcpServerUrl,
-        appEvents,
-      );
-
-      context.ui.addItem(
-        {
-          type: 'info',
-          text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
-        },
-        Date.now(),
-      );
-
-      // Trigger tool re-discovery to pick up authenticated server
+      // Trigger server restart which will automatically initiate OAuth flow
+      // via MCPOAuthClientProvider if the server requires authentication
       const mcpClientManager = config.getMcpClientManager();
-      if (mcpClientManager) {
-        context.ui.addItem(
-          {
-            type: 'info',
-            text: `Restarting MCP server '${serverName}'...`,
-          },
-          Date.now(),
-        );
-        await mcpClientManager.restartServer(serverName);
+      if (!mcpClientManager) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: 'MCP client manager not available.',
+        };
       }
+
+      context.ui.addItem({
+        type: 'info',
+        text: `Connecting to MCP server '${serverName}'...`,
+      });
+
+      // Restart the server to trigger OAuth flow
+      await mcpClientManager.restartServer(serverName);
+
+      context.ui.addItem({
+        type: 'info',
+        text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
+      });
+
       // Update the client with the new tools
       const geminiClient = config.getGeminiClient();
       if (geminiClient?.isInitialized()) {
@@ -163,7 +151,7 @@ const authCommand: SlashCommand = {
         content: `Failed to authenticate with MCP server '${serverName}': ${getErrorMessage(error)}`,
       };
     } finally {
-      appEvents.removeListener(AppEvent.OauthDisplayMessage, displayListener);
+      coreEvents.removeListener(CoreEvent.OauthDisplayMessage, displayListener);
     }
   },
   completion: async (context: CommandContext, partialArg: string) => {
@@ -250,6 +238,14 @@ const listAction = async (
     }
   }
 
+  // Get enablement state for all servers
+  const enablementManager = McpServerEnablementManager.getInstance();
+  const enablementState: HistoryItemMcpStatus['enablementState'] = {};
+  for (const serverName of serverNames) {
+    enablementState[serverName] =
+      await enablementManager.getDisplayState(serverName);
+  }
+
   const mcpStatusItem: HistoryItemMcpStatus = {
     type: MessageType.MCP_STATUS,
     servers: mcpServers,
@@ -272,6 +268,7 @@ const listAction = async (
       description: resource.description,
     })),
     authStatus,
+    enablementState,
     blockedServers: blockedMcpServers,
     discoveryInProgress,
     connectingServers,
@@ -279,7 +276,7 @@ const listAction = async (
     showSchema,
   };
 
-  context.ui.addItem(mcpStatusItem, Date.now());
+  context.ui.addItem(mcpStatusItem);
 };
 
 const listCommand: SlashCommand = {
@@ -335,13 +332,10 @@ const refreshCommand: SlashCommand = {
       };
     }
 
-    context.ui.addItem(
-      {
-        type: 'info',
-        text: 'Restarting MCP servers...',
-      },
-      Date.now(),
-    );
+    context.ui.addItem({
+      type: 'info',
+      text: 'Restarting MCP servers...',
+    });
 
     await mcpClientManager.restart();
 
@@ -358,6 +352,143 @@ const refreshCommand: SlashCommand = {
   },
 };
 
+async function handleEnableDisable(
+  context: CommandContext,
+  args: string,
+  enable: boolean,
+): Promise<MessageActionReturn> {
+  const { config } = context.services;
+  if (!config) {
+    return {
+      type: 'message',
+      messageType: 'error',
+      content: 'Config not loaded.',
+    };
+  }
+
+  const parts = args.trim().split(/\s+/);
+  const isSession = parts.includes('--session');
+  const serverName = parts.filter((p) => p !== '--session')[0];
+  const action = enable ? 'enable' : 'disable';
+
+  if (!serverName) {
+    return {
+      type: 'message',
+      messageType: 'error',
+      content: `Server name required. Usage: /mcp ${action} <server-name> [--session]`,
+    };
+  }
+
+  const name = normalizeServerId(serverName);
+
+  // Validate server exists
+  const servers = config.getMcpClientManager()?.getMcpServers() || {};
+  const normalizedServerNames = Object.keys(servers).map(normalizeServerId);
+  if (!normalizedServerNames.includes(name)) {
+    return {
+      type: 'message',
+      messageType: 'error',
+      content: `Server '${serverName}' not found. Use /mcp list to see available servers.`,
+    };
+  }
+
+  const manager = McpServerEnablementManager.getInstance();
+
+  if (enable) {
+    const settings = loadSettings();
+    const result = await canLoadServer(name, {
+      adminMcpEnabled: settings.merged.admin?.mcp?.enabled ?? true,
+      allowedList: settings.merged.mcp?.allowed,
+      excludedList: settings.merged.mcp?.excluded,
+    });
+    if (
+      !result.allowed &&
+      (result.blockType === 'allowlist' || result.blockType === 'excludelist')
+    ) {
+      return {
+        type: 'message',
+        messageType: 'error',
+        content: result.reason ?? 'Blocked by settings.',
+      };
+    }
+    if (isSession) {
+      manager.clearSessionDisable(name);
+    } else {
+      await manager.enable(name);
+    }
+    if (result.blockType === 'admin') {
+      context.ui.addItem(
+        {
+          type: 'warning',
+          text: 'MCP disabled by admin. Will load when enabled.',
+        },
+        Date.now(),
+      );
+    }
+  } else {
+    if (isSession) {
+      manager.disableForSession(name);
+    } else {
+      await manager.disable(name);
+    }
+  }
+
+  const msg = `MCP server '${name}' ${enable ? 'enabled' : 'disabled'}${isSession ? ' for this session' : ''}.`;
+
+  const mcpClientManager = config.getMcpClientManager();
+  if (mcpClientManager) {
+    context.ui.addItem(
+      { type: 'info', text: 'Restarting MCP servers...' },
+      Date.now(),
+    );
+    await mcpClientManager.restart();
+  }
+  if (config.getGeminiClient()?.isInitialized())
+    await config.getGeminiClient().setTools();
+  context.ui.reloadCommands();
+
+  return { type: 'message', messageType: 'info', content: msg };
+}
+
+async function getEnablementCompletion(
+  context: CommandContext,
+  partialArg: string,
+  showEnabled: boolean,
+): Promise<string[]> {
+  const { config } = context.services;
+  if (!config) return [];
+  const servers = Object.keys(
+    config.getMcpClientManager()?.getMcpServers() || {},
+  );
+  const manager = McpServerEnablementManager.getInstance();
+  const results: string[] = [];
+  for (const n of servers) {
+    const state = await manager.getDisplayState(n);
+    if (state.enabled === showEnabled && n.startsWith(partialArg)) {
+      results.push(n);
+    }
+  }
+  return results;
+}
+
+const enableCommand: SlashCommand = {
+  name: 'enable',
+  description: 'Enable a disabled MCP server',
+  kind: CommandKind.BUILT_IN,
+  autoExecute: true,
+  action: (ctx, args) => handleEnableDisable(ctx, args, true),
+  completion: (ctx, arg) => getEnablementCompletion(ctx, arg, false),
+};
+
+const disableCommand: SlashCommand = {
+  name: 'disable',
+  description: 'Disable an MCP server',
+  kind: CommandKind.BUILT_IN,
+  autoExecute: true,
+  action: (ctx, args) => handleEnableDisable(ctx, args, false),
+  completion: (ctx, arg) => getEnablementCompletion(ctx, arg, true),
+};
+
 export const mcpCommand: SlashCommand = {
   name: 'mcp',
   description: 'Manage configured Model Context Protocol (MCP) servers',
@@ -369,6 +500,8 @@ export const mcpCommand: SlashCommand = {
     schemaCommand,
     authCommand,
     refreshCommand,
+    enableCommand,
+    disableCommand,
   ],
   action: async (context: CommandContext) => listAction(context),
 };

@@ -7,9 +7,14 @@
 import * as Diff from 'diff';
 import type { DiffStat } from './tools.js';
 
+const DEFAULT_STRUCTURED_PATCH_OPTS: Diff.PatchOptions = {
+  context: 3,
+  ignoreWhitespace: false,
+};
+
 export const DEFAULT_DIFF_OPTIONS: Diff.PatchOptions = {
   context: 3,
-  ignoreWhitespace: true,
+  ignoreWhitespace: false,
 };
 
 export function getDiffStat(
@@ -45,7 +50,7 @@ export function getDiffStat(
     aiStr,
     'Current',
     'Proposed',
-    DEFAULT_DIFF_OPTIONS,
+    DEFAULT_STRUCTURED_PATCH_OPTS,
   );
   const modelStats = getStats(modelPatch);
 
@@ -56,7 +61,7 @@ export function getDiffStat(
     userStr,
     'Proposed',
     'User',
-    DEFAULT_DIFF_OPTIONS,
+    DEFAULT_STRUCTURED_PATCH_OPTS,
   );
   const userStats = getStats(userPatch);
 
