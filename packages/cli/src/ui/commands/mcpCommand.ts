@@ -95,9 +95,6 @@ const authCommand: SlashCommand = {
       };
     }
 
-    // Always attempt OAuth authentication, even if not explicitly configured
-    // The authentication process will discover OAuth requirements automatically
-
     const displayListener = (message: string) => {
       context.ui.addItem({ type: 'info', text: message });
     };
@@ -109,32 +106,30 @@ const authCommand: SlashCommand = {
         text: `Starting OAuth authentication for MCP server '${serverName}'...`,
       });
 
-      // Import dynamically to avoid circular dependencies
-      const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
-
-      let oauthConfig = server.oauth;
-      if (!oauthConfig) {
-        oauthConfig = { enabled: false };
+      // Trigger server restart which will automatically initiate OAuth flow
+      // via MCPOAuthClientProvider if the server requires authentication
+      const mcpClientManager = config.getMcpClientManager();
+      if (!mcpClientManager) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: 'MCP client manager not available.',
+        };
       }
 
-      const mcpServerUrl = server.httpUrl || server.url;
-      const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-      await authProvider.authenticate(serverName, oauthConfig, mcpServerUrl);
+      context.ui.addItem({
+        type: 'info',
+        text: `Connecting to MCP server '${serverName}'...`,
+      });
+
+      // Restart the server to trigger OAuth flow
+      await mcpClientManager.restartServer(serverName);
 
       context.ui.addItem({
         type: 'info',
         text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
       });
 
-      // Trigger tool re-discovery to pick up authenticated server
-      const mcpClientManager = config.getMcpClientManager();
-      if (mcpClientManager) {
-        context.ui.addItem({
-          type: 'info',
-          text: `Restarting MCP server '${serverName}'...`,
-        });
-        await mcpClientManager.restartServer(serverName);
-      }
       // Update the client with the new tools
       const geminiClient = config.getGeminiClient();
       if (geminiClient?.isInitialized()) {
