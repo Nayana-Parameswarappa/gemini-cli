@@ -109,17 +109,10 @@ const authCommand: SlashCommand = {
         text: `Starting OAuth authentication for MCP server '${serverName}'...`,
       });
 
-      // Import dynamically to avoid circular dependencies
-      const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
-
-      let oauthConfig = server.oauth;
-      if (!oauthConfig) {
-        oauthConfig = { enabled: false };
-      }
-
-      const mcpServerUrl = server.httpUrl || server.url;
-      const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-      await authProvider.authenticate(serverName, oauthConfig, mcpServerUrl);
+      const oauthConfig = {
+        ...(server.oauth ?? {}),
+        enabled: true,
+      };
 
       context.ui.addItem({
         type: 'info',
@@ -133,7 +126,15 @@ const authCommand: SlashCommand = {
           type: 'info',
           text: `Restarting MCP server '${serverName}'...`,
         });
-        await mcpClientManager.restartServer(serverName);
+        const updatedServerConfig = {
+          ...server,
+          oauth: oauthConfig,
+        };
+        await mcpClientManager.maybeDiscoverMcpServer(
+          serverName,
+          updatedServerConfig,
+        );
+        await config.refreshMcpContext();
       }
       // Update the client with the new tools
       const geminiClient = config.getGeminiClient();

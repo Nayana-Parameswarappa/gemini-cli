@@ -1955,7 +1955,7 @@ describe('connectToMcpServer with OAuth', () => {
     vi.clearAllMocks();
   });
 
-  it('should handle automatic OAuth flow on 401 with www-authenticate header', async () => {
+  it('should propagate 401 when OAuth callback is not completed', async () => {
     const serverUrl = 'http://test-server.com/';
     const authUrl = 'http://auth.example.com/auth';
     const tokenUrl = 'http://auth.example.com/token';
@@ -1974,35 +1974,21 @@ describe('connectToMcpServer with OAuth', () => {
       scopes: ['test-scope'],
     });
 
-    // We need this to be an any type because we dig into its private state.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let capturedTransport: any;
-    vi.mocked(mockedClient.connect).mockImplementationOnce(
-      async (transport) => {
-        capturedTransport = transport;
-        return Promise.resolve();
-      },
-    );
+    await expect(
+      connectToMcpServer(
+        '0.0.1',
+        'test-server',
+        { httpUrl: serverUrl, oauth: { enabled: true } },
+        false,
+        workspaceContext,
+        EMPTY_CONFIG,
+      ),
+    ).rejects.toThrow('Unauthorized');
 
-    const client = await connectToMcpServer(
-      '0.0.1',
-      'test-server',
-      { httpUrl: serverUrl, oauth: { enabled: true } },
-      false,
-      workspaceContext,
-      EMPTY_CONFIG,
-    );
-
-    expect(client).toBe(mockedClient);
-    expect(mockedClient.connect).toHaveBeenCalledTimes(2);
-    expect(mockAuthProvider.authenticate).toHaveBeenCalledOnce();
-
-    const authHeader =
-      capturedTransport._requestInit?.headers?.['Authorization'];
-    expect(authHeader).toBe('Bearer test-access-token');
+    expect(mockedClient.connect).toHaveBeenCalledTimes(1);
   });
 
-  it('should discover oauth config if not in www-authenticate header', async () => {
+  it('should propagate 401 when OAuth callback is not completed (no header)', async () => {
     const serverUrl = 'http://test-server.com';
     const authUrl = 'http://auth.example.com/auth';
     const tokenUrl = 'http://auth.example.com/token';
@@ -2020,33 +2006,18 @@ describe('connectToMcpServer with OAuth', () => {
       'test-access-token-from-discovery',
     );
 
-    // We need this to be an any type because we dig into its private state.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let capturedTransport: any;
-    vi.mocked(mockedClient.connect).mockImplementationOnce(
-      async (transport) => {
-        capturedTransport = transport;
-        return Promise.resolve();
-      },
-    );
+    await expect(
+      connectToMcpServer(
+        '0.0.1',
+        'test-server',
+        { httpUrl: serverUrl, oauth: { enabled: true } },
+        false,
+        workspaceContext,
+        EMPTY_CONFIG,
+      ),
+    ).rejects.toThrow('Unauthorized');
 
-    const client = await connectToMcpServer(
-      '0.0.1',
-      'test-server',
-      { httpUrl: serverUrl, oauth: { enabled: true } },
-      false,
-      workspaceContext,
-      EMPTY_CONFIG,
-    );
-
-    expect(client).toBe(mockedClient);
-    expect(mockedClient.connect).toHaveBeenCalledTimes(2);
-    expect(mockAuthProvider.authenticate).toHaveBeenCalledOnce();
-    expect(OAuthUtils.discoverOAuthConfig).toHaveBeenCalledWith(serverUrl);
-
-    const authHeader =
-      capturedTransport._requestInit?.headers?.['Authorization'];
-    expect(authHeader).toBe('Bearer test-access-token-from-discovery');
+    expect(mockedClient.connect).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2244,24 +2215,23 @@ describe('connectToMcpServer - OAuth with transport fallback', () => {
     vi.unstubAllGlobals();
   });
 
-  it('should handle HTTP 404 → SSE 401 → OAuth → SSE+OAuth succeeds', async () => {
-    // Tests that OAuth flow works when SSE (not HTTP) requires auth
+  it('should fail fast on HTTP 404 when OAuth is enabled and callback flow is not completed', async () => {
     vi.mocked(mockedClient.connect)
       .mockRejectedValueOnce(new StreamableHTTPError(404, 'Not Found'))
       .mockRejectedValueOnce(new StreamableHTTPError(401, 'Unauthorized'))
       .mockResolvedValueOnce(undefined);
 
-    const client = await connectToMcpServer(
-      '0.0.1',
-      'test-server',
-      { url: 'http://test-server', oauth: { enabled: true } },
-      false,
-      workspaceContext,
-      EMPTY_CONFIG,
-    );
+    await expect(
+      connectToMcpServer(
+        '0.0.1',
+        'test-server',
+        { url: 'http://test-server', oauth: { enabled: true } },
+        false,
+        workspaceContext,
+        EMPTY_CONFIG,
+      ),
+    ).rejects.toThrow('Not Found');
 
-    expect(client).toBe(mockedClient);
-    expect(mockedClient.connect).toHaveBeenCalledTimes(3);
-    expect(mockAuthProvider.authenticate).toHaveBeenCalledOnce();
+    expect(mockedClient.connect).toHaveBeenCalledTimes(1);
   });
 });
