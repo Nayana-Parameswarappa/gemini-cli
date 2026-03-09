@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2025 Google LLC
+ * Copyright 2026 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -12,8 +12,6 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { debugLogger } from '../utils/debugLogger.js';
 
-export const OAUTH_DISPLAY_MESSAGE_EVENT = 'oauth-display-message' as const;
-
 /**
  * OAuth authorization response.
  */
@@ -22,30 +20,26 @@ export interface OAuthAuthorizationResponse {
   state: string;
 }
 
+type CallbackServer = {
+  port: Promise<number>;
+  waitForResponse: () => Promise<OAuthAuthorizationResponse>;
+  close: () => Promise<void>;
+};
+
 export class MCPOAuthClientProvider implements OAuthClientProvider {
   private _clientInformation?: OAuthClientInformation;
   private _tokens?: OAuthTokens;
   private _codeVerifier?: string;
-  private _cbServer?: {
-    port: Promise<number>;
-    waitForResponse: () => Promise<OAuthAuthorizationResponse>;
-    close: () => Promise<void>;
-  };
+  private _cbServer?: CallbackServer;
 
   constructor(
     private readonly _redirectUrl: string | URL,
     private readonly _clientMetadata: OAuthClientMetadata,
     private readonly _state?: string | undefined,
-    onRedirect?: (url: URL) => void,
-  ) {
-    this._onRedirect =
-      onRedirect ||
-      ((url) => {
-        debugLogger.log(`Redirect to: ${url.toString()}`);
-      });
-  }
-
-  private _onRedirect: (url: URL) => void;
+    private readonly _onRedirect: (url: URL) => void = (url) => {
+      debugLogger.log(`Redirect to: ${url.toString()}`);
+    },
+  ) {}
 
   get redirectUrl(): string | URL {
     return this._redirectUrl;
@@ -55,22 +49,11 @@ export class MCPOAuthClientProvider implements OAuthClientProvider {
     return this._clientMetadata;
   }
 
-  saveCallbackServer(server: {
-    port: Promise<number>;
-    waitForResponse: () => Promise<OAuthAuthorizationResponse>;
-    close: () => Promise<void>;
-  }): void {
+  saveCallbackServer(server: CallbackServer): void {
     this._cbServer = server;
   }
 
-  // expose getter so _cbServer is read by the class (fixes TS6133)
-  getSavedCallbackServer():
-    | {
-        port: Promise<number>;
-        waitForResponse: () => Promise<OAuthAuthorizationResponse>;
-        close: () => Promise<void>;
-      }
-    | undefined {
+  getSavedCallbackServer(): CallbackServer | undefined {
     return this._cbServer;
   }
 
