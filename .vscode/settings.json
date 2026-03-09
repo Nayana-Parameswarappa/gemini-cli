@@ -19,5 +19,8 @@
   "[markdown]": {
     "editor.defaultFormatter": "esbenp.prettier-vscode"
   },
+  "terminal.integrated.env.osx": {
+    "GEMINI_CLI_ENABLE_MCP_SDK_OAUTH": "1"
+  },
   "vitest.disableWorkspaceWarning": true
 }
