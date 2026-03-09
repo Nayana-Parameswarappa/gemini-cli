@@ -58,6 +58,10 @@ export class XcodeMcpBridgeFixTransport
     await this.transport.send(message);
   }
 
+  getUnderlyingTransport(): Transport {
+    return this.transport;
+  }
+
   private handleMessage(message: JSONRPCMessage) {
     if (this.isJsonResponse(message)) {
       this.fixStructuredContent(message);

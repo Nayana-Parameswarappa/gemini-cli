@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2026 Google LLC
+ * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -20,26 +20,30 @@ export interface OAuthAuthorizationResponse {
   state: string;
 }
 
-type CallbackServer = {
-  port: Promise<number>;
-  waitForResponse: () => Promise<OAuthAuthorizationResponse>;
-  close: () => Promise<void>;
-};
-
 export class MCPOAuthClientProvider implements OAuthClientProvider {
   private _clientInformation?: OAuthClientInformation;
   private _tokens?: OAuthTokens;
   private _codeVerifier?: string;
-  private _cbServer?: CallbackServer;
+  private _cbServer?: {
+    port: Promise<number>;
+    waitForResponse: () => Promise<OAuthAuthorizationResponse>;
+    close: () => Promise<void>;
+  };
 
   constructor(
     private readonly _redirectUrl: string | URL,
     private readonly _clientMetadata: OAuthClientMetadata,
     private readonly _state?: string | undefined,
-    private readonly _onRedirect: (url: URL) => void = (url) => {
-      debugLogger.log(`Redirect to: ${url.toString()}`);
-    },
-  ) {}
+    onRedirect?: (url: URL) => void,
+  ) {
+    this._onRedirect =
+      onRedirect ||
+      ((url) => {
+        debugLogger.log(`Redirect to: ${url.toString()}`);
+      });
+  }
+
+  private _onRedirect: (url: URL) => void;
 
   get redirectUrl(): string | URL {
     return this._redirectUrl;
@@ -49,11 +53,22 @@ export class MCPOAuthClientProvider implements OAuthClientProvider {
     return this._clientMetadata;
   }
 
-  saveCallbackServer(server: CallbackServer): void {
+  saveCallbackServer(server: {
+    port: Promise<number>;
+    waitForResponse: () => Promise<OAuthAuthorizationResponse>;
+    close: () => Promise<void>;
+  }): void {
     this._cbServer = server;
   }
 
-  getSavedCallbackServer(): CallbackServer | undefined {
+  // expose getter so _cbServer is read by the class (fixes TS6133)
+  getSavedCallbackServer():
+    | {
+        port: Promise<number>;
+        waitForResponse: () => Promise<OAuthAuthorizationResponse>;
+        close: () => Promise<void>;
+      }
+    | undefined {
     return this._cbServer;
   }
 

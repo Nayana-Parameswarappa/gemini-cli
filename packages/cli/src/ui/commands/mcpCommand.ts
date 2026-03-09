@@ -56,8 +56,6 @@ const authCommand: SlashCommand = {
       };
     }
 
-    config.setUserInteractedWithMcp();
-
     const mcpServers = config.getMcpClientManager()?.getMcpServers() ?? {};
 
     if (!serverName) {
@@ -192,7 +190,7 @@ const authCommand: SlashCommand = {
       return {
         type: 'message',
         messageType: 'info',
-        content: `Successfully authenticated and reloaded tools for '${serverName}'`,
+        content: `Successfully authenticated and refreshed tools for '${serverName}'.`,
       };
     } catch (error) {
       return {
@@ -228,8 +226,6 @@ const listAction = async (
       content: 'Config not loaded.',
     };
   }
-
-  config.setUserInteractedWithMcp();
 
   const toolRegistry = config.getToolRegistry();
   if (!toolRegistry) {
@@ -293,16 +289,12 @@ const listAction = async (
   // Get enablement state for all servers
   const enablementManager = McpServerEnablementManager.getInstance();
   const enablementState: HistoryItemMcpStatus['enablementState'] = {};
+  const errors: HistoryItemMcpStatus['errors'] = {};
   for (const serverName of serverNames) {
     enablementState[serverName] =
       await enablementManager.getDisplayState(serverName);
-  }
-  const errors: Record<string, string> = {};
-  for (const serverName of serverNames) {
     const error = config.getMcpClientManager()?.getLastError(serverName);
-    if (error) {
-      errors[serverName] = error;
-    }
+    errors[serverName] = error ? getErrorMessage(error) : '';
   }
 
   const mcpStatusItem: HistoryItemMcpStatus = {
@@ -329,18 +321,16 @@ const listAction = async (
     authStatus,
     enablementState,
     errors,
-    blockedServers: blockedMcpServers.map((s) => ({
-      name: s.name,
-      extensionName: s.extensionName,
-    })),
+    blockedServers: blockedMcpServers,
     discoveryInProgress,
     connectingServers,
-    showDescriptions: Boolean(showDescriptions),
-    showSchema: Boolean(showSchema),
+    showDescriptions,
+    showSchema,
   };
 
   context.ui.addItem(mcpStatusItem);
 };
+
 const listCommand: SlashCommand = {
   name: 'list',
   altNames: ['ls', 'nodesc', 'nodescription'],
@@ -368,10 +358,10 @@ const schemaCommand: SlashCommand = {
   action: (context) => listAction(context, true, true),
 };
 
-const reloadCommand: SlashCommand = {
-  name: 'reload',
-  altNames: ['refresh'],
-  description: 'Reloads MCP servers',
+const refreshCommand: SlashCommand = {
+  name: 'refresh',
+  altNames: ['reload'],
+  description: 'Restarts MCP servers',
   kind: CommandKind.BUILT_IN,
   autoExecute: true,
   action: async (
@@ -397,7 +387,7 @@ const reloadCommand: SlashCommand = {
 
     context.ui.addItem({
       type: 'info',
-      text: 'Reloading MCP servers...',
+      text: 'Restarting MCP servers...',
     });
 
     await mcpClientManager.restart();
@@ -428,8 +418,6 @@ async function handleEnableDisable(
       content: 'Config not loaded.',
     };
   }
-
-  config.setUserInteractedWithMcp();
 
   const parts = args.trim().split(/\s+/);
   const isSession = parts.includes('--session');
@@ -503,7 +491,7 @@ async function handleEnableDisable(
   const mcpClientManager = config.getMcpClientManager();
   if (mcpClientManager) {
     context.ui.addItem(
-      { type: 'info', text: 'Reloading MCP servers...' },
+      { type: 'info', text: 'Restarting MCP servers...' },
       Date.now(),
     );
     await mcpClientManager.restart();
@@ -564,7 +552,7 @@ export const mcpCommand: SlashCommand = {
     descCommand,
     schemaCommand,
     authCommand,
-    reloadCommand,
+    refreshCommand,
     enableCommand,
     disableCommand,
   ],
