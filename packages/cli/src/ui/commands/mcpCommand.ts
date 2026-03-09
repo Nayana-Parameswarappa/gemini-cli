@@ -19,6 +19,7 @@ import {
   MCPServerStatus,
   getErrorMessage,
   MCPOAuthTokenStorage,
+  MCPOAuthProvider,
   mcpServerRequiresOAuth,
   CoreEvent,
   coreEvents,
@@ -31,6 +32,9 @@ import {
   canLoadServer,
 } from '../../config/mcp/mcpServerEnablement.js';
 import { loadSettings } from '../../config/settings.js';
+
+const MCP_SDK_OAUTH_ENABLED =
+  process.env['GEMINI_CLI_ENABLE_MCP_SDK_OAUTH'] !== '0';
 
 const authCommand: SlashCommand = {
   name: 'auth',
@@ -110,6 +114,44 @@ const authCommand: SlashCommand = {
         type: 'info',
         text: `Starting OAuth authentication for MCP server '${serverName}'...`,
       });
+
+      if (!MCP_SDK_OAUTH_ENABLED) {
+        let oauthConfig = server.oauth;
+        if (!oauthConfig) {
+          oauthConfig = { enabled: false };
+        }
+
+        const mcpServerUrl = server.httpUrl || server.url;
+        const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
+        await authProvider.authenticate(serverName, oauthConfig, mcpServerUrl);
+
+        context.ui.addItem({
+          type: 'info',
+          text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
+        });
+
+        const mcpClientManager = config.getMcpClientManager();
+        if (mcpClientManager) {
+          context.ui.addItem({
+            type: 'info',
+            text: `Restarting MCP server '${serverName}'...`,
+          });
+          await mcpClientManager.restartServer(serverName);
+        }
+
+        const geminiClient = config.getGeminiClient();
+        if (geminiClient?.isInitialized()) {
+          await geminiClient.setTools();
+        }
+
+        context.ui.reloadCommands();
+
+        return {
+          type: 'message',
+          messageType: 'info',
+          content: `Successfully authenticated and refreshed tools for '${serverName}'.`,
+        };
+      }
 
       const oauthConfig = {
         ...(server.oauth ?? {}),
