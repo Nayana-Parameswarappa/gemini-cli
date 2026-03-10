@@ -19,7 +19,6 @@ import {
   MCPServerStatus,
   getErrorMessage,
   MCPOAuthTokenStorage,
-  MCPOAuthProvider,
   mcpServerRequiresOAuth,
   CoreEvent,
   coreEvents,
@@ -32,69 +31,6 @@ import {
   canLoadServer,
 } from '../../config/mcp/mcpServerEnablement.js';
 import { loadSettings } from '../../config/settings.js';
-
-const MCP_SDK_OAUTH_ENABLED =
-  process.env['GEMINI_CLI_ENABLE_MCP_SDK_OAUTH'] !== '0';
-
-const MCP_AUTH_WAIT_TIMEOUT_MS = 2 * 60 * 1000;
-const MCP_AUTH_WAIT_POLL_INTERVAL_MS = 250;
-const MCP_AUTH_DISCOVERY_TIMEOUT_MS = 90 * 1000;
-const MCP_AUTH_CONNECTED_CHECK_TIMEOUT_MS = 8 * 1000;
-
-async function waitForMcpServerConnected(
-  serverName: string,
-  mcpClientManager:
-    | ReturnType<
-        NonNullable<CommandContext['services']['config']>['getMcpClientManager']
-      >
-    | undefined,
-  timeoutMs: number = MCP_AUTH_WAIT_TIMEOUT_MS,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    if (getMCPServerStatus(serverName) === MCPServerStatus.CONNECTED) {
-      return true;
-    }
-
-    await new Promise((resolve) =>
-      setTimeout(resolve, MCP_AUTH_WAIT_POLL_INTERVAL_MS),
-    );
-  }
-
-  const managerError =
-    typeof mcpClientManager?.getLastError === 'function'
-      ? mcpClientManager.getLastError(serverName)
-      : undefined;
-
-  if (managerError) {
-    throw new Error(managerError);
-  }
-
-  return false;
-}
-
-async function runMcpDiscoveryWithTimeout<TConfig>(
-  serverName: string,
-  maybeDiscoverMcpServer: (name: string, config: TConfig) => Promise<void>,
-  updatedServerConfig: TConfig,
-): Promise<{ completed: boolean; discoveryPromise: Promise<void> }> {
-  const discoveryPromise = maybeDiscoverMcpServer(
-    serverName,
-    updatedServerConfig,
-  );
-
-  const completed = await Promise.race([
-    discoveryPromise.then(() => true),
-    new Promise<boolean>((resolve) => {
-      setTimeout(() => {
-        resolve(false);
-      }, MCP_AUTH_DISCOVERY_TIMEOUT_MS);
-    }),
-  ]);
-
-  return { completed, discoveryPromise };
-}
 
 const authCommand: SlashCommand = {
   name: 'auth',
@@ -115,6 +51,8 @@ const authCommand: SlashCommand = {
         content: 'Config not loaded.',
       };
     }
+
+    config.setUserInteractedWithMcp();
 
     const mcpServers = config.getMcpClientManager()?.getMcpServers() ?? {};
 
@@ -173,57 +111,21 @@ const authCommand: SlashCommand = {
         text: `Starting OAuth authentication for MCP server '${serverName}'...`,
       });
 
-      if (!MCP_SDK_OAUTH_ENABLED) {
-        let oauthConfig = server.oauth;
-        if (!oauthConfig) {
-          oauthConfig = { enabled: false };
-        }
+      // Import dynamically to avoid circular dependencies
+      const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
 
-        const mcpServerUrl = server.httpUrl || server.url;
-        const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-        await authProvider.authenticate(serverName, oauthConfig, mcpServerUrl);
-
-        context.ui.addItem({
-          type: 'info',
-          text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
-        });
-
-        const mcpClientManager = config.getMcpClientManager();
-        if (mcpClientManager) {
-          context.ui.addItem({
-            type: 'info',
-            text: `Restarting MCP server '${serverName}'...`,
-          });
-          await mcpClientManager.restartServer(serverName);
-        }
-
-        const geminiClient = config.getGeminiClient();
-        if (geminiClient?.isInitialized()) {
-          await geminiClient.setTools();
-        }
-
-        context.ui.reloadCommands();
-
-        context.ui.addItem({
-          type: 'info',
-          text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
-        });
-
-        return {
-          type: 'message',
-          messageType: 'info',
-          content: `Successfully authenticated and refreshed tools for '${serverName}'.`,
-        };
+      let oauthConfig = server.oauth;
+      if (!oauthConfig) {
+        oauthConfig = { enabled: false };
       }
 
-      const oauthConfig = {
-        ...(server.oauth ?? {}),
-        enabled: true,
-      };
+      const mcpServerUrl = server.httpUrl || server.url;
+      const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
+      await authProvider.authenticate(serverName, oauthConfig, mcpServerUrl);
 
       context.ui.addItem({
         type: 'info',
-        text: `Waiting for OAuth callback from MCP server '${serverName}'...`,
+        text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
       });
 
       // Trigger tool re-discovery to pick up authenticated server
@@ -233,136 +135,21 @@ const authCommand: SlashCommand = {
           type: 'info',
           text: `Restarting MCP server '${serverName}'...`,
         });
-        const updatedServerConfig = {
-          ...server,
-          oauth: oauthConfig,
-        };
-        const { completed, discoveryPromise } =
-          await runMcpDiscoveryWithTimeout(
-            serverName,
-            mcpClientManager.maybeDiscoverMcpServer.bind(mcpClientManager),
-            updatedServerConfig,
-          );
-
-        if (!completed) {
-          context.ui.addItem({
-            type: 'info',
-            text: `OAuth completed for '${serverName}'. MCP reconnect is still running in the background...`,
-          });
-
-          void discoveryPromise
-            .then(async () => {
-              await config.refreshMcpContext();
-
-              const geminiClient = config.getGeminiClient();
-              if (geminiClient?.isInitialized()) {
-                await geminiClient.setTools();
-              }
-
-              context.ui.reloadCommands();
-              context.ui.addItem({
-                type: 'info',
-                text: `✅ MCP server '${serverName}' is ready.`,
-              });
-              context.ui.addItem({
-                type: 'info',
-                text: `Successfully authenticated and refreshed tools for '${serverName}'.`,
-              });
-              context.ui.addItem({
-                type: 'info',
-                text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
-              });
-            })
-            .catch((error: unknown) => {
-              context.ui.addItem({
-                type: 'error',
-                text: `MCP reconnect failed for '${serverName}': ${getErrorMessage(error)}`,
-              });
-            });
-
-          return {
-            type: 'message',
-            messageType: 'info',
-            content: `Authentication completed for '${serverName}'. MCP tool refresh continues in the background.`,
-          };
-        }
-
-        await config.refreshMcpContext();
+        await mcpClientManager.restartServer(serverName);
       }
-
-      const isConnected = await waitForMcpServerConnected(
-        serverName,
-        mcpClientManager,
-        MCP_AUTH_CONNECTED_CHECK_TIMEOUT_MS,
-      );
-
-      if (!isConnected) {
-        context.ui.addItem({
-          type: 'info',
-          text: `OAuth completed for '${serverName}'. Final MCP readiness checks continue in the background...`,
-        });
-
-        void (async () => {
-          try {
-            await waitForMcpServerConnected(serverName, mcpClientManager);
-            await config.refreshMcpContext();
-
-            const geminiClient = config.getGeminiClient();
-            if (geminiClient?.isInitialized()) {
-              await geminiClient.setTools();
-            }
-
-            context.ui.reloadCommands();
-            context.ui.addItem({
-              type: 'info',
-              text: `✅ MCP server '${serverName}' is ready.`,
-            });
-            context.ui.addItem({
-              type: 'info',
-              text: `Successfully authenticated and refreshed tools for '${serverName}'.`,
-            });
-            context.ui.addItem({
-              type: 'info',
-              text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
-            });
-          } catch (error: unknown) {
-            context.ui.addItem({
-              type: 'error',
-              text: `MCP finalization failed for '${serverName}': ${getErrorMessage(error)}`,
-            });
-          }
-        })();
-
-        return {
-          type: 'message',
-          messageType: 'info',
-          content: `Authentication completed for '${serverName}'. MCP tool refresh continues in the background.`,
-        };
-      }
-
       // Update the client with the new tools
       const geminiClient = config.getGeminiClient();
       if (geminiClient?.isInitialized()) {
         await geminiClient.setTools();
       }
 
-      context.ui.addItem({
-        type: 'info',
-        text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
-      });
-
       // Reload the slash commands to reflect the changes.
       context.ui.reloadCommands();
-
-      context.ui.addItem({
-        type: 'info',
-        text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
-      });
 
       return {
         type: 'message',
         messageType: 'info',
-        content: `Successfully authenticated and refreshed tools for '${serverName}'.`,
+        content: `Successfully authenticated and reloaded tools for '${serverName}'`,
       };
     } catch (error) {
       return {
@@ -398,6 +185,8 @@ const listAction = async (
       content: 'Config not loaded.',
     };
   }
+
+  config.setUserInteractedWithMcp();
 
   const toolRegistry = config.getToolRegistry();
   if (!toolRegistry) {
@@ -461,12 +250,16 @@ const listAction = async (
   // Get enablement state for all servers
   const enablementManager = McpServerEnablementManager.getInstance();
   const enablementState: HistoryItemMcpStatus['enablementState'] = {};
-  const errors: HistoryItemMcpStatus['errors'] = {};
   for (const serverName of serverNames) {
     enablementState[serverName] =
       await enablementManager.getDisplayState(serverName);
+  }
+  const errors: Record<string, string> = {};
+  for (const serverName of serverNames) {
     const error = config.getMcpClientManager()?.getLastError(serverName);
-    errors[serverName] = error ? getErrorMessage(error) : '';
+    if (error) {
+      errors[serverName] = error;
+    }
   }
 
   const mcpStatusItem: HistoryItemMcpStatus = {
@@ -493,16 +286,18 @@ const listAction = async (
     authStatus,
     enablementState,
     errors,
-    blockedServers: blockedMcpServers,
+    blockedServers: blockedMcpServers.map((s) => ({
+      name: s.name,
+      extensionName: s.extensionName,
+    })),
     discoveryInProgress,
     connectingServers,
-    showDescriptions,
-    showSchema,
+    showDescriptions: Boolean(showDescriptions),
+    showSchema: Boolean(showSchema),
   };
 
   context.ui.addItem(mcpStatusItem);
 };
-
 const listCommand: SlashCommand = {
   name: 'list',
   altNames: ['ls', 'nodesc', 'nodescription'],
@@ -530,10 +325,10 @@ const schemaCommand: SlashCommand = {
   action: (context) => listAction(context, true, true),
 };
 
-const refreshCommand: SlashCommand = {
-  name: 'refresh',
-  altNames: ['reload'],
-  description: 'Restarts MCP servers',
+const reloadCommand: SlashCommand = {
+  name: 'reload',
+  altNames: ['refresh'],
+  description: 'Reloads MCP servers',
   kind: CommandKind.BUILT_IN,
   autoExecute: true,
   action: async (
@@ -559,7 +354,7 @@ const refreshCommand: SlashCommand = {
 
     context.ui.addItem({
       type: 'info',
-      text: 'Restarting MCP servers...',
+      text: 'Reloading MCP servers...',
     });
 
     await mcpClientManager.restart();
@@ -590,6 +385,8 @@ async function handleEnableDisable(
       content: 'Config not loaded.',
     };
   }
+
+  config.setUserInteractedWithMcp();
 
   const parts = args.trim().split(/\s+/);
   const isSession = parts.includes('--session');
@@ -663,7 +460,7 @@ async function handleEnableDisable(
   const mcpClientManager = config.getMcpClientManager();
   if (mcpClientManager) {
     context.ui.addItem(
-      { type: 'info', text: 'Restarting MCP servers...' },
+      { type: 'info', text: 'Reloading MCP servers...' },
       Date.now(),
     );
     await mcpClientManager.restart();
@@ -724,7 +521,7 @@ export const mcpCommand: SlashCommand = {
     descCommand,
     schemaCommand,
     authCommand,
-    refreshCommand,
+    reloadCommand,
     enableCommand,
     disableCommand,
   ],
