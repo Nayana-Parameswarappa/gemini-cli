@@ -68,7 +68,7 @@ async function waitForMcpServerConnected(
       : undefined;
 
   if (managerError) {
-    throw new Error(managerError);
+    throw new Error(getErrorMessage(managerError));
   }
 
   return false;
@@ -439,7 +439,7 @@ const listAction = async (
   for (const serverName of serverNames) {
     const error = config.getMcpClientManager()?.getLastError(serverName);
     if (error) {
-      errors[serverName] = error;
+      errors[serverName] = getErrorMessage(error);
     }
   }
 
