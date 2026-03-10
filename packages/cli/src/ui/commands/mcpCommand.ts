@@ -111,17 +111,10 @@ const authCommand: SlashCommand = {
         text: `Starting OAuth authentication for MCP server '${serverName}'...`,
       });
 
-      // Import dynamically to avoid circular dependencies
-      const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
-
-      let oauthConfig = server.oauth;
-      if (!oauthConfig) {
-        oauthConfig = { enabled: false };
-      }
-
-      const mcpServerUrl = server.httpUrl || server.url;
-      const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-      await authProvider.authenticate(serverName, oauthConfig, mcpServerUrl);
+      const oauthConfig = {
+        ...(server.oauth ?? {}),
+        enabled: true,
+      };
 
       context.ui.addItem({
         type: 'info',
@@ -135,7 +128,15 @@ const authCommand: SlashCommand = {
           type: 'info',
           text: `Restarting MCP server '${serverName}'...`,
         });
-        await mcpClientManager.restartServer(serverName);
+        const updatedServerConfig = {
+          ...server,
+          oauth: oauthConfig,
+        };
+        await mcpClientManager.maybeDiscoverMcpServer(
+          serverName,
+          updatedServerConfig,
+        );
+        await config.refreshMcpContext();
       }
       // Update the client with the new tools
       const geminiClient = config.getGeminiClient();
@@ -149,7 +150,7 @@ const authCommand: SlashCommand = {
       return {
         type: 'message',
         messageType: 'info',
-        content: `Successfully authenticated and reloaded tools for '${serverName}'`,
+        content: `Successfully authenticated and refreshed tools for '${serverName}'.`,
       };
     } catch (error) {
       return {
@@ -169,6 +170,231 @@ const authCommand: SlashCommand = {
     return Object.keys(mcpServers).filter((name) =>
       name.startsWith(partialArg),
     );
+  },
+};
+
+const callCommand: SlashCommand = {
+  name: 'call',
+  description:
+    'Call an MCP server tool (e.g. /mcp call <server> with <param> <value>)',
+  kind: CommandKind.BUILT_IN,
+  autoExecute: true,
+  action: async (
+    context: CommandContext,
+    args: string,
+  ): Promise<MessageActionReturn> => {
+    const { config } = context.services;
+    if (!config) {
+      return {
+        type: 'message',
+        messageType: 'error',
+        content: 'Config not loaded.',
+      };
+    }
+
+    config.setUserInteractedWithMcp();
+
+    const trimmed = args.trim();
+    if (!trimmed) {
+      return {
+        type: 'message',
+        messageType: 'error',
+        content:
+          'Usage: /mcp call <server-name> with <param> <value> (example: /mcp call echo with message hi)',
+      };
+    }
+
+    const withMatch = trimmed.match(
+      /^([^\s]+)\s+with\s+([^\s]+)\s+([\s\S]+)$/i,
+    );
+    const serverName = withMatch ? withMatch[1] : trimmed.split(/\s+/)[0];
+    const params: Record<string, unknown> =
+      withMatch && withMatch[2] ? { [withMatch[2]]: withMatch[3] } : {};
+
+    const mcpClientManager = config.getMcpClientManager();
+    const mcpServers = mcpClientManager?.getMcpServers() ?? {};
+    const server = mcpServers[serverName];
+    if (!server) {
+      return {
+        type: 'message',
+        messageType: 'error',
+        content: `MCP server '${serverName}' not found.`,
+      };
+    }
+
+    const sleep = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+
+    const ensureAuthenticatedInCall = async (): Promise<
+      MessageActionReturn | undefined
+    > => {
+      const manager = config.getMcpClientManager();
+      if (!manager) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: 'Could not retrieve mcp client manager.',
+        };
+      }
+
+      context.ui.addItem({
+        type: 'info',
+        text: `Starting OAuth authentication for MCP server '${serverName}'...`,
+      });
+
+      const oauthConfig = {
+        ...(server.oauth ?? {}),
+        enabled: true,
+      };
+
+      // Explicitly run OAuth acquisition first. Some servers (like echo) only
+      // report auth failures at tool-call time and won't trigger SDK auth on connect.
+      const mcpServerUrl = server.httpUrl || server.url;
+      try {
+        const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
+        const authProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
+        await authProvider.authenticate(serverName, oauthConfig, mcpServerUrl);
+      } catch (error) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: `Failed to authenticate with MCP server '${serverName}': ${getErrorMessage(error)}`,
+        };
+      }
+
+      const tokenStorage = new MCPOAuthTokenStorage();
+      const creds = await tokenStorage.getCredentials(serverName);
+      if (!creds) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: `OAuth finished but no credentials were stored for '${serverName}'.`,
+        };
+      }
+
+      const updatedServerConfig = {
+        ...server,
+        oauth: oauthConfig,
+      };
+
+      try {
+        await manager.maybeDiscoverMcpServer(serverName, updatedServerConfig);
+        await config.refreshMcpContext();
+
+        const geminiClient = config.getGeminiClient();
+        if (geminiClient?.isInitialized()) {
+          await geminiClient.setTools();
+        }
+
+        for (let index = 0; index < 12; index++) {
+          if (getMCPServerStatus(serverName) === MCPServerStatus.CONNECTED) {
+            return;
+          }
+          await sleep(250);
+        }
+
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: `MCP server '${serverName}' is not connected after authentication.`,
+        };
+      } catch (error) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: `Failed to authenticate with MCP server '${serverName}': ${getErrorMessage(error)}`,
+        };
+      }
+    };
+
+    // Proactively start OAuth if server requires/configures OAuth but is not authenticated yet.
+    if (server.oauth?.enabled || mcpServerRequiresOAuth.has(serverName)) {
+      const tokenStorage = new MCPOAuthTokenStorage();
+      const creds = await tokenStorage.getCredentials(serverName);
+      const isExpired = !!(
+        creds?.token?.expiresAt && creds.token.expiresAt < Date.now()
+      );
+      const isAuthenticated = !!creds && !isExpired;
+
+      if (!isAuthenticated) {
+        const authResult = await ensureAuthenticatedInCall();
+        if (authResult) {
+          return authResult;
+        }
+      }
+    }
+
+    const resolveServerTool = (): DiscoveredMCPTool | undefined => {
+      const toolRegistry = config.getToolRegistry();
+      const allTools = toolRegistry.getAllTools();
+      return allTools.find(
+        (tool): tool is DiscoveredMCPTool =>
+          tool instanceof DiscoveredMCPTool && tool.serverName === serverName,
+      );
+    };
+
+    let tool = resolveServerTool();
+    if (!tool) {
+      return {
+        type: 'message',
+        messageType: 'error',
+        content: `No tools found for MCP server '${serverName}'.`,
+      };
+    }
+    let result = await tool.validateBuildAndExecute(
+      params,
+      new AbortController().signal,
+    );
+
+    const isAuthRequiredError = (message: string) =>
+      /(unauthoriz|not authenticated|oauth|authentication credential|login cookie)/i.test(
+        message,
+      );
+
+    if (result.error && isAuthRequiredError(result.error.message)) {
+      context.ui.addItem({
+        type: 'info',
+        text: `Authentication required for '${serverName}'. Starting OAuth flow...`,
+      });
+
+      const authResult = await ensureAuthenticatedInCall();
+      if (authResult) {
+        return authResult;
+      }
+
+      tool = resolveServerTool();
+      if (!tool) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: `No tools found for MCP server '${serverName}' after authentication.`,
+        };
+      }
+
+      result = await tool.validateBuildAndExecute(
+        params,
+        new AbortController().signal,
+      );
+    }
+
+    if (result.error) {
+      return {
+        type: 'message',
+        messageType: 'error',
+        content: `MCP call failed (${tool.name}): ${result.error.message}`,
+      };
+    }
+
+    const output =
+      typeof result.returnDisplay === 'string'
+        ? result.returnDisplay
+        : JSON.stringify(result.returnDisplay, null, 2);
+
+    return {
+      type: 'message',
+      messageType: 'info',
+      content: output,
+    };
   },
 };
 
@@ -520,6 +746,7 @@ export const mcpCommand: SlashCommand = {
     listCommand,
     descCommand,
     schemaCommand,
+    callCommand,
     authCommand,
     reloadCommand,
     enableCommand,

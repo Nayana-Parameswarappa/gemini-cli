@@ -113,6 +113,15 @@ vi.mock('../ui/auth/useAuth.js', () => ({
   validateAuthMethodWithSettings: () => null,
 }));
 
+vi.mock('../ui/utils/terminalSetup.js', async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import('../ui/utils/terminalSetup.js')>();
+  return {
+    ...original,
+    useTerminalSetupPrompt: () => {},
+  };
+});
+
 // A minimal mock ExtensionManager to satisfy AppContainer's forceful cast
 class MockExtensionManager extends ExtensionLoader {
   getExtensions = vi.fn().mockReturnValue([]);
@@ -382,11 +391,11 @@ export class AppRig {
     return isAnyToolActive || isAwaitingConfirmation;
   }
 
-  render() {
+  async render() {
     if (!this.config || !this.settings)
       throw new Error('AppRig not initialized');
 
-    act(() => {
+    await act(async () => {
       this.renderResult = renderWithProviders(
         <AppContainer
           config={this.config!}
@@ -409,6 +418,9 @@ export class AppRig {
           },
         },
       );
+
+      await this.renderResult.waitUntilReady();
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
   }
 
@@ -696,7 +708,8 @@ export class AppRig {
   }
 
   async waitForIdle(timeout = 20000) {
-    await this.waitForOutput('Type your message', timeout);
+    await this.renderResult?.waitUntilReady();
+    await this.waitForOutput(/Type your message|@path\/to\/file/, timeout);
   }
 
   async sendMessage(text: string) {

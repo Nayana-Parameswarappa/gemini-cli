@@ -13,6 +13,8 @@ import {
   getMCPServerStatus,
   getMCPDiscoveryState,
   DiscoveredMCPTool,
+  MCPOAuthProvider,
+  MCPOAuthTokenStorage,
   type MessageBus,
 } from '@google/gemini-cli-core';
 
@@ -31,7 +33,7 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
       authenticate: mockAuthenticate,
     })),
     MCPOAuthTokenStorage: vi.fn(() => ({
-      getToken: vi.fn(),
+      getCredentials: vi.fn(),
       isTokenExpired: vi.fn(),
     })),
   };
@@ -79,6 +81,7 @@ describe('mcpCommand', () => {
     getResourceRegistry: ReturnType<typeof vi.fn>;
     setUserInteractedWithMcp: ReturnType<typeof vi.fn>;
     getLastMcpError: ReturnType<typeof vi.fn>;
+    refreshMcpContext: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
@@ -115,6 +118,7 @@ describe('mcpCommand', () => {
       }),
       setUserInteractedWithMcp: vi.fn(),
       getLastMcpError: vi.fn().mockReturnValue(undefined),
+      refreshMcpContext: vi.fn().mockResolvedValue(undefined),
     };
 
     mockContext = createMockCommandContext({
@@ -271,6 +275,146 @@ describe('mcpCommand', () => {
           showDescriptions: false,
         }),
       );
+    });
+  });
+
+  describe('call subcommand auth behavior', () => {
+    it('should proactively authenticate on /mcp call when OAuth is enabled and credentials are missing', async () => {
+      const callSubCommand = mcpCommand.subCommands!.find(
+        (c) => c.name === 'call',
+      );
+
+      const mockGetCredentials = vi
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          token: { accessToken: 'token', expiresAt: Date.now() + 60_000 },
+        });
+
+      const mockTokenStorageInstance = {
+        getCredentials: mockGetCredentials,
+        isTokenExpired: vi.fn().mockReturnValue(false),
+      };
+      vi.mocked(MCPOAuthTokenStorage).mockImplementation(
+        () => mockTokenStorageInstance as unknown as MCPOAuthTokenStorage,
+      );
+
+      const mockAuthenticate = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(MCPOAuthProvider).mockImplementation(
+        () =>
+          ({
+            authenticate: mockAuthenticate,
+          }) as unknown as MCPOAuthProvider,
+      );
+
+      const tool = createMockMCPTool('echo_tool', 'echo');
+      const executeSpy = vi
+        .spyOn(tool, 'validateBuildAndExecute')
+        .mockResolvedValue({ returnDisplay: 'hi' } as never);
+
+      const manager = {
+        getBlockedMcpServers: vi.fn().mockReturnValue([]),
+        getMcpServers: vi.fn().mockReturnValue({
+          echo: {
+            httpUrl: 'http://localhost:4100/mcp',
+            oauth: { enabled: true },
+          },
+        }),
+        maybeDiscoverMcpServer: vi.fn().mockResolvedValue(undefined),
+        getLastError: vi.fn().mockReturnValue(undefined),
+      };
+
+      mockConfig.getMcpClientManager = vi.fn().mockReturnValue(manager);
+      mockConfig.getToolRegistry = vi.fn().mockReturnValue({
+        getAllTools: vi.fn().mockReturnValue([tool]),
+      });
+      mockConfig.getGeminiClient = vi.fn().mockReturnValue(undefined);
+
+      const result = await callSubCommand!.action!(
+        mockContext,
+        'echo with message hi',
+      );
+
+      expect(mockAuthenticate).toHaveBeenCalledOnce();
+      expect(manager.maybeDiscoverMcpServer).toHaveBeenCalledWith(
+        'echo',
+        expect.objectContaining({
+          oauth: expect.objectContaining({ enabled: true }),
+        }),
+      );
+      expect(executeSpy).toHaveBeenCalledWith(
+        { message: 'hi' },
+        expect.any(AbortSignal),
+      );
+      expect(result).toEqual({
+        type: 'message',
+        messageType: 'info',
+        content: 'hi',
+      });
+    });
+
+    it('should authenticate and retry when tool call fails with auth-required error', async () => {
+      const callSubCommand = mcpCommand.subCommands!.find(
+        (c) => c.name === 'call',
+      );
+
+      const mockTokenStorageInstance = {
+        getCredentials: vi.fn().mockResolvedValue({
+          token: { accessToken: 'token', expiresAt: Date.now() + 60_000 },
+        }),
+        isTokenExpired: vi.fn().mockReturnValue(false),
+      };
+      vi.mocked(MCPOAuthTokenStorage).mockImplementation(
+        () => mockTokenStorageInstance as unknown as MCPOAuthTokenStorage,
+      );
+
+      const mockAuthenticate = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(MCPOAuthProvider).mockImplementation(
+        () =>
+          ({
+            authenticate: mockAuthenticate,
+          }) as unknown as MCPOAuthProvider,
+      );
+
+      const tool = createMockMCPTool('echo_tool', 'echo');
+      const executeSpy = vi
+        .spyOn(tool, 'validateBuildAndExecute')
+        .mockResolvedValueOnce({
+          error: new Error('missing required authentication credential'),
+        } as never)
+        .mockResolvedValueOnce({
+          returnDisplay: 'authenticated response',
+        } as never);
+
+      const manager = {
+        getBlockedMcpServers: vi.fn().mockReturnValue([]),
+        getMcpServers: vi.fn().mockReturnValue({
+          echo: {
+            httpUrl: 'http://localhost:4100/mcp',
+          },
+        }),
+        maybeDiscoverMcpServer: vi.fn().mockResolvedValue(undefined),
+        getLastError: vi.fn().mockReturnValue(undefined),
+      };
+
+      mockConfig.getMcpClientManager = vi.fn().mockReturnValue(manager);
+      mockConfig.getToolRegistry = vi.fn().mockReturnValue({
+        getAllTools: vi.fn().mockReturnValue([tool]),
+      });
+      mockConfig.getGeminiClient = vi.fn().mockReturnValue(undefined);
+
+      const result = await callSubCommand!.action!(
+        mockContext,
+        'echo with message hi',
+      );
+
+      expect(mockAuthenticate).toHaveBeenCalledOnce();
+      expect(executeSpy).toHaveBeenCalledTimes(2);
+      expect(result).toEqual({
+        type: 'message',
+        messageType: 'info',
+        content: 'authenticated response',
+      });
     });
   });
 });
