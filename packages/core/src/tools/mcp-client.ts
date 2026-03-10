@@ -756,6 +756,9 @@ let mcpDiscoveryState: MCPDiscoveryState = MCPDiscoveryState.NOT_STARTED;
  */
 export const mcpServerRequiresOAuth: Map<string, boolean> = new Map();
 
+const isMcpOAuthReworkEnabled = () =>
+  process.env['GEMINI_CLI_ENABLE_MCP_SDK_OAUTH'] !== '0';
+
 /**
  * Event listeners for MCP server status changes
  */
@@ -1869,7 +1872,8 @@ export async function connectToMcpServer(
 
       // Only trigger automatic OAuth if explicitly enabled in config
       // Otherwise, show error and tell user to run /mcp auth command
-      const shouldTriggerOAuth = mcpServerConfig.oauth?.enabled;
+      const shouldTriggerOAuth =
+        isMcpOAuthReworkEnabled() || mcpServerConfig.oauth?.enabled;
 
       if (!shouldTriggerOAuth) {
         await showAuthRequiredMessage(mcpServerName, cliConfig);
@@ -1967,7 +1971,8 @@ export async function connectToMcpServer(
       } else {
         // No www-authenticate header found, but we got a 401
         // Only try OAuth discovery when OAuth is explicitly enabled in config
-        const shouldTryDiscovery = mcpServerConfig.oauth?.enabled;
+        const shouldTryDiscovery =
+          isMcpOAuthReworkEnabled() || mcpServerConfig.oauth?.enabled;
 
         if (!shouldTryDiscovery) {
           await showAuthRequiredMessage(mcpServerName, cliConfig);
@@ -2145,7 +2150,10 @@ export async function createTransport(
     if (authProvider === undefined) {
       // Check if we have OAuth configuration or stored tokens
       let accessToken: string | null = null;
-      if (mcpServerConfig.oauth?.enabled && mcpServerConfig.oauth) {
+      if (
+        (isMcpOAuthReworkEnabled() || mcpServerConfig.oauth?.enabled) &&
+        mcpServerConfig.oauth
+      ) {
         const tokenStorage = new MCPOAuthTokenStorage();
         const mcpAuthProvider = new MCPOAuthProvider(tokenStorage);
         accessToken = await mcpAuthProvider.getValidToken(

@@ -32,6 +32,9 @@ import {
 } from '../../config/mcp/mcpServerEnablement.js';
 import { loadSettings } from '../../config/settings.js';
 
+const MCP_SDK_OAUTH_ENABLED =
+  process.env['GEMINI_CLI_ENABLE_MCP_SDK_OAUTH'] !== '0';
+
 const authCommand: SlashCommand = {
   name: 'auth',
   description: 'Authenticate with an OAuth-enabled MCP server',
@@ -111,6 +114,48 @@ const authCommand: SlashCommand = {
         text: `Starting OAuth authentication for MCP server '${serverName}'...`,
       });
 
+      const mcpClientManager = config.getMcpClientManager();
+
+      if (
+        MCP_SDK_OAUTH_ENABLED &&
+        mcpClientManager &&
+        'maybeDiscoverMcpServer' in mcpClientManager &&
+        typeof mcpClientManager.maybeDiscoverMcpServer === 'function'
+      ) {
+        const oauthConfig = {
+          ...(server.oauth ?? {}),
+          enabled: true,
+        };
+
+        const updatedServerConfig = {
+          ...server,
+          oauth: oauthConfig,
+        };
+        context.ui.addItem({
+          type: 'info',
+          text: `Waiting for OAuth callback from MCP server '${serverName}'...`,
+        });
+
+        await mcpClientManager.maybeDiscoverMcpServer(
+          serverName,
+          updatedServerConfig,
+        );
+        await config.refreshMcpContext();
+
+        const geminiClient = config.getGeminiClient();
+        if (geminiClient?.isInitialized()) {
+          await geminiClient.setTools();
+        }
+
+        context.ui.reloadCommands();
+
+        return {
+          type: 'message',
+          messageType: 'info',
+          content: `Successfully authenticated and reloaded tools for '${serverName}'`,
+        };
+      }
+
       // Import dynamically to avoid circular dependencies
       const { MCPOAuthProvider } = await import('@google/gemini-cli-core');
 
@@ -129,7 +174,6 @@ const authCommand: SlashCommand = {
       });
 
       // Trigger tool re-discovery to pick up authenticated server
-      const mcpClientManager = config.getMcpClientManager();
       if (mcpClientManager) {
         context.ui.addItem({
           type: 'info',
