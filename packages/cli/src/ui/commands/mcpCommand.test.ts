@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mcpCommand } from './mcpCommand.js';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { createMockCommandContext } from '../../test-utils/mockCommandContext.js';
 import {
   MCPServerStatus,
@@ -19,17 +18,25 @@ import {
 import type { CallableTool } from '@google/genai';
 import { MessageType } from '../types.js';
 
+const { mockAuthenticate, mockMCPOAuthProvider } = vi.hoisted(() => {
+  const authenticate = vi.fn();
+  const mcpOAuthProvider = vi.fn(() => ({
+    authenticate,
+  }));
+  return {
+    mockAuthenticate: authenticate,
+    mockMCPOAuthProvider: mcpOAuthProvider,
+  };
+});
+
 vi.mock('@google/gemini-cli-core', async (importOriginal) => {
   const actual =
     await importOriginal<typeof import('@google/gemini-cli-core')>();
-  const mockAuthenticate = vi.fn();
   return {
     ...actual,
     getMCPServerStatus: vi.fn(),
     getMCPDiscoveryState: vi.fn(),
-    MCPOAuthProvider: vi.fn(() => ({
-      authenticate: mockAuthenticate,
-    })),
+    MCPOAuthProvider: mockMCPOAuthProvider,
     MCPOAuthTokenStorage: vi.fn(() => ({
       getToken: vi.fn(),
       isTokenExpired: vi.fn(),
@@ -68,6 +75,7 @@ const createMockMCPTool = (
   );
 
 describe('mcpCommand', () => {
+  let mcpCommand: (typeof import('./mcpCommand.js'))['mcpCommand'];
   let mockContext: ReturnType<typeof createMockCommandContext>;
   let mockConfig: {
     getToolRegistry: ReturnType<typeof vi.fn>;
@@ -77,15 +85,27 @@ describe('mcpCommand', () => {
     getGeminiClient: ReturnType<typeof vi.fn>;
     getMcpClientManager: ReturnType<typeof vi.fn>;
     getResourceRegistry: ReturnType<typeof vi.fn>;
-    setUserInteractedWithMcp: ReturnType<typeof vi.fn>;
-    getLastMcpError: ReturnType<typeof vi.fn>;
+    refreshMcpContext: ReturnType<typeof vi.fn>;
   };
 
-  beforeEach(() => {
+  const loadMcpCommandWithFlag = async (flagValue?: string) => {
+    vi.resetModules();
+    vi.unstubAllEnvs();
+    if (flagValue !== undefined) {
+      vi.stubEnv('GEMINI_CLI_ENABLE_MCP_SDK_OAUTH', flagValue);
+    }
+    const mod = await import('./mcpCommand.js');
+    return mod.mcpCommand;
+  };
+
+  beforeEach(async () => {
     vi.clearAllMocks();
+    mockAuthenticate.mockReset();
+    mockMCPOAuthProvider.mockClear();
 
     // Set up default mock environment
     vi.unstubAllEnvs();
+    mcpCommand = await loadMcpCommandWithFlag();
 
     // Default mock implementations
     vi.mocked(getMCPServerStatus).mockReturnValue(MCPServerStatus.CONNECTED);
@@ -106,15 +126,14 @@ describe('mcpCommand', () => {
       }),
       getGeminiClient: vi.fn(),
       getMcpClientManager: vi.fn().mockImplementation(() => ({
-        getBlockedMcpServers: vi.fn().mockReturnValue([]),
-        getMcpServers: vi.fn().mockReturnValue({}),
-        getLastError: vi.fn().mockReturnValue(undefined),
+        getBlockedMcpServers: vi.fn(),
+        getMcpServers: vi.fn(),
+        getLastError: vi.fn(),
       })),
       getResourceRegistry: vi.fn().mockReturnValue({
         getAllResources: vi.fn().mockReturnValue([]),
       }),
-      setUserInteractedWithMcp: vi.fn(),
-      getLastMcpError: vi.fn().mockReturnValue(undefined),
+      refreshMcpContext: vi.fn().mockResolvedValue(undefined),
     };
 
     mockContext = createMockCommandContext({
@@ -122,10 +141,7 @@ describe('mcpCommand', () => {
         config: mockConfig,
       },
     });
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
+    mockContext.ui.reloadCommands = vi.fn();
   });
 
   describe('basic functionality', () => {
@@ -271,6 +287,100 @@ describe('mcpCommand', () => {
           showDescriptions: false,
         }),
       );
+    });
+  });
+
+  describe('auth subcommand', () => {
+    it('uses discovery flow when MCP SDK OAuth flag is enabled', async () => {
+      mcpCommand = await loadMcpCommandWithFlag('1');
+
+      const maybeDiscoverMcpServer = vi.fn().mockResolvedValue(undefined);
+      const restartServer = vi.fn().mockResolvedValue(undefined);
+      const mcpServers = {
+        oauthServer: {
+          url: 'https://example.com/mcp',
+          oauth: { enabled: false },
+        },
+      };
+      mockConfig.getMcpClientManager = vi.fn().mockReturnValue({
+        getMcpServers: vi.fn().mockReturnValue(mcpServers),
+        getBlockedMcpServers: vi.fn().mockReturnValue([]),
+        maybeDiscoverMcpServer,
+        restartServer,
+        getLastError: vi.fn().mockReturnValue(undefined),
+      });
+      const setTools = vi.fn().mockResolvedValue(undefined);
+      mockConfig.getGeminiClient = vi.fn().mockReturnValue({
+        isInitialized: vi.fn().mockReturnValue(true),
+        setTools,
+      });
+
+      const authSubCommand = mcpCommand.subCommands!.find(
+        (c) => c.name === 'auth',
+      );
+      const result = await authSubCommand!.action!(mockContext, 'oauthServer');
+
+      expect(maybeDiscoverMcpServer).toHaveBeenCalledWith(
+        'oauthServer',
+        expect.objectContaining({
+          oauth: expect.objectContaining({ enabled: true }),
+        }),
+      );
+      expect(mockConfig.refreshMcpContext).toHaveBeenCalled();
+      expect(restartServer).not.toHaveBeenCalled();
+      expect(mockAuthenticate).not.toHaveBeenCalled();
+      expect(setTools).toHaveBeenCalled();
+      expect(mockContext.ui.reloadCommands).toHaveBeenCalled();
+      expect(result).toEqual({
+        type: 'message',
+        messageType: 'info',
+        content:
+          "Successfully authenticated and refreshed tools for 'oauthServer'.",
+      });
+    });
+
+    it('uses provider authentication and restart flow when MCP SDK OAuth flag is disabled', async () => {
+      mcpCommand = await loadMcpCommandWithFlag('0');
+
+      const restartServer = vi.fn().mockResolvedValue(undefined);
+      const mcpServers = {
+        oauthServer: {
+          url: 'https://example.com/mcp',
+          oauth: { enabled: true },
+        },
+      };
+      mockConfig.getMcpClientManager = vi.fn().mockReturnValue({
+        getMcpServers: vi.fn().mockReturnValue(mcpServers),
+        getBlockedMcpServers: vi.fn().mockReturnValue([]),
+        restartServer,
+        getLastError: vi.fn().mockReturnValue(undefined),
+      });
+      const setTools = vi.fn().mockResolvedValue(undefined);
+      mockConfig.getGeminiClient = vi.fn().mockReturnValue({
+        isInitialized: vi.fn().mockReturnValue(true),
+        setTools,
+      });
+
+      const authSubCommand = mcpCommand.subCommands!.find(
+        (c) => c.name === 'auth',
+      );
+      const result = await authSubCommand!.action!(mockContext, 'oauthServer');
+
+      expect(mockMCPOAuthProvider).toHaveBeenCalled();
+      expect(mockAuthenticate).toHaveBeenCalledWith(
+        'oauthServer',
+        expect.objectContaining({ enabled: true }),
+        'https://example.com/mcp',
+      );
+      expect(restartServer).toHaveBeenCalledWith('oauthServer');
+      expect(setTools).toHaveBeenCalled();
+      expect(mockContext.ui.reloadCommands).toHaveBeenCalled();
+      expect(result).toEqual({
+        type: 'message',
+        messageType: 'info',
+        content:
+          "Successfully authenticated and refreshed tools for 'oauthServer'.",
+      });
     });
   });
 });
