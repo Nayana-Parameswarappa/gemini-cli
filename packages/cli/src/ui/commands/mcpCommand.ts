@@ -36,6 +36,66 @@ import { loadSettings } from '../../config/settings.js';
 const MCP_SDK_OAUTH_ENABLED =
   process.env['GEMINI_CLI_ENABLE_MCP_SDK_OAUTH'] !== '0';
 
+const MCP_AUTH_WAIT_TIMEOUT_MS = 2 * 60 * 1000;
+const MCP_AUTH_WAIT_POLL_INTERVAL_MS = 250;
+const MCP_AUTH_DISCOVERY_TIMEOUT_MS = 90 * 1000;
+const MCP_AUTH_CONNECTED_CHECK_TIMEOUT_MS = 8 * 1000;
+
+async function waitForMcpServerConnected(
+  serverName: string,
+  mcpClientManager:
+    | ReturnType<
+        NonNullable<CommandContext['services']['config']>['getMcpClientManager']
+      >
+    | undefined,
+  timeoutMs: number = MCP_AUTH_WAIT_TIMEOUT_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (getMCPServerStatus(serverName) === MCPServerStatus.CONNECTED) {
+      return true;
+    }
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, MCP_AUTH_WAIT_POLL_INTERVAL_MS),
+    );
+  }
+
+  const managerError =
+    typeof mcpClientManager?.getLastError === 'function'
+      ? mcpClientManager.getLastError(serverName)
+      : undefined;
+
+  if (managerError) {
+    throw new Error(managerError);
+  }
+
+  return false;
+}
+
+async function runMcpDiscoveryWithTimeout<TConfig>(
+  serverName: string,
+  maybeDiscoverMcpServer: (name: string, config: TConfig) => Promise<void>,
+  updatedServerConfig: TConfig,
+): Promise<{ completed: boolean; discoveryPromise: Promise<void> }> {
+  const discoveryPromise = maybeDiscoverMcpServer(
+    serverName,
+    updatedServerConfig,
+  );
+
+  const completed = await Promise.race([
+    discoveryPromise.then(() => true),
+    new Promise<boolean>((resolve) => {
+      setTimeout(() => {
+        resolve(false);
+      }, MCP_AUTH_DISCOVERY_TIMEOUT_MS);
+    }),
+  ]);
+
+  return { completed, discoveryPromise };
+}
+
 const authCommand: SlashCommand = {
   name: 'auth',
   description: 'Authenticate with an OAuth-enabled MCP server',
@@ -144,6 +204,11 @@ const authCommand: SlashCommand = {
 
         context.ui.reloadCommands();
 
+        context.ui.addItem({
+          type: 'info',
+          text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
+        });
+
         return {
           type: 'message',
           messageType: 'info',
@@ -158,7 +223,7 @@ const authCommand: SlashCommand = {
 
       context.ui.addItem({
         type: 'info',
-        text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
+        text: `Waiting for OAuth callback from MCP server '${serverName}'...`,
       });
 
       // Trigger tool re-discovery to pick up authenticated server
@@ -172,20 +237,127 @@ const authCommand: SlashCommand = {
           ...server,
           oauth: oauthConfig,
         };
-        await mcpClientManager.maybeDiscoverMcpServer(
-          serverName,
-          updatedServerConfig,
-        );
+        const { completed, discoveryPromise } =
+          await runMcpDiscoveryWithTimeout(
+            serverName,
+            mcpClientManager.maybeDiscoverMcpServer.bind(mcpClientManager),
+            updatedServerConfig,
+          );
+
+        if (!completed) {
+          context.ui.addItem({
+            type: 'info',
+            text: `OAuth completed for '${serverName}'. MCP reconnect is still running in the background...`,
+          });
+
+          void discoveryPromise
+            .then(async () => {
+              await config.refreshMcpContext();
+
+              const geminiClient = config.getGeminiClient();
+              if (geminiClient?.isInitialized()) {
+                await geminiClient.setTools();
+              }
+
+              context.ui.reloadCommands();
+              context.ui.addItem({
+                type: 'info',
+                text: `✅ MCP server '${serverName}' is ready.`,
+              });
+              context.ui.addItem({
+                type: 'info',
+                text: `Successfully authenticated and refreshed tools for '${serverName}'.`,
+              });
+              context.ui.addItem({
+                type: 'info',
+                text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
+              });
+            })
+            .catch((error: unknown) => {
+              context.ui.addItem({
+                type: 'error',
+                text: `MCP reconnect failed for '${serverName}': ${getErrorMessage(error)}`,
+              });
+            });
+
+          return {
+            type: 'message',
+            messageType: 'info',
+            content: `Authentication completed for '${serverName}'. MCP tool refresh continues in the background.`,
+          };
+        }
+
         await config.refreshMcpContext();
       }
+
+      const isConnected = await waitForMcpServerConnected(
+        serverName,
+        mcpClientManager,
+        MCP_AUTH_CONNECTED_CHECK_TIMEOUT_MS,
+      );
+
+      if (!isConnected) {
+        context.ui.addItem({
+          type: 'info',
+          text: `OAuth completed for '${serverName}'. Final MCP readiness checks continue in the background...`,
+        });
+
+        void (async () => {
+          try {
+            await waitForMcpServerConnected(serverName, mcpClientManager);
+            await config.refreshMcpContext();
+
+            const geminiClient = config.getGeminiClient();
+            if (geminiClient?.isInitialized()) {
+              await geminiClient.setTools();
+            }
+
+            context.ui.reloadCommands();
+            context.ui.addItem({
+              type: 'info',
+              text: `✅ MCP server '${serverName}' is ready.`,
+            });
+            context.ui.addItem({
+              type: 'info',
+              text: `Successfully authenticated and refreshed tools for '${serverName}'.`,
+            });
+            context.ui.addItem({
+              type: 'info',
+              text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
+            });
+          } catch (error: unknown) {
+            context.ui.addItem({
+              type: 'error',
+              text: `MCP finalization failed for '${serverName}': ${getErrorMessage(error)}`,
+            });
+          }
+        })();
+
+        return {
+          type: 'message',
+          messageType: 'info',
+          content: `Authentication completed for '${serverName}'. MCP tool refresh continues in the background.`,
+        };
+      }
+
       // Update the client with the new tools
       const geminiClient = config.getGeminiClient();
       if (geminiClient?.isInitialized()) {
         await geminiClient.setTools();
       }
 
+      context.ui.addItem({
+        type: 'info',
+        text: `✅ Successfully authenticated with MCP server '${serverName}'!`,
+      });
+
       // Reload the slash commands to reflect the changes.
       context.ui.reloadCommands();
+
+      context.ui.addItem({
+        type: 'info',
+        text: `Next: type '/mcp list' to verify tools for '${serverName}'.`,
+      });
 
       return {
         type: 'message',

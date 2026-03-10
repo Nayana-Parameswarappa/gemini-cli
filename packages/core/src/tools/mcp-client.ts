@@ -23,14 +23,16 @@ import type {
   Prompt,
   ReadResourceResult,
   Resource,
-
+  Tool as McpTool,
+} from '@modelcontextprotocol/sdk/types.js';
+import {
   ListResourcesResultSchema,
   ListRootsRequestSchema,
   ReadResourceResultSchema,
   ResourceListChangedNotificationSchema,
   ToolListChangedNotificationSchema,
   PromptListChangedNotificationSchema,
-  type Tool as McpTool} from '@modelcontextprotocol/sdk/types.js';
+} from '@modelcontextprotocol/sdk/types.js';
 import { ApprovalMode, PolicyDecision } from '../policy/types.js';
 import { parse } from 'shell-quote';
 import type { Config, MCPServerConfig } from '../config/config.js';
@@ -44,7 +46,7 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { CallableTool, FunctionCall, Part, Tool } from '@google/genai';
 import { basename } from 'node:path';
-import { pathToFileURL , URL } from 'node:url';
+import { pathToFileURL, URL } from 'node:url';
 import type { McpAuthProvider } from '../mcp/auth-provider.js';
 import { MCPOAuthProvider } from '../mcp/oauth-provider.js';
 import { MCPOAuthTokenStorage } from '../mcp/oauth-token-storage.js';
@@ -68,7 +70,7 @@ import * as crypto from 'node:crypto';
 import type { ToolRegistry } from './tool-registry.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import { type MessageBus } from '../confirmation-bus/message-bus.js';
-import { coreEvents } from '../utils/events.js';
+import { CoreEvent, coreEvents } from '../utils/events.js';
 import type { ResourceRegistry } from '../resources/resource-registry.js';
 import {
   sanitizeEnvironment,
@@ -2133,6 +2135,10 @@ function startPersistentCallbackServer(): void {
       }
 
       debugLogger.log(`📥 Received OAuth callback: ${req.url}`);
+      coreEvents.emit(
+        CoreEvent.OauthDisplayMessage,
+        'OAuth callback received. Exchanging authorization code for token...',
+      );
       const parsedUrl = new URL(req.url || '', 'http://localhost');
       const code = parsedUrl.searchParams.get('code');
       const error = parsedUrl.searchParams.get('error');
@@ -2226,8 +2232,23 @@ function startPersistentCallbackServer(): void {
           code.substring(0, 10) + '...',
         );
         try {
-          await activeOAuthTransport.finishAuth(code);
+          await Promise.race([
+            activeOAuthTransport.finishAuth(code),
+            new Promise<never>((_, reject) => {
+              setTimeout(() => {
+                reject(
+                  new Error(
+                    'Timed out while exchanging authorization code for tokens',
+                  ),
+                );
+              }, 60_000);
+            }),
+          ]);
           debugLogger.log('✅ OAuth flow completed - tokens exchanged');
+          coreEvents.emit(
+            CoreEvent.OauthDisplayMessage,
+            'OAuth token exchange completed. Reconnecting MCP server...',
+          );
 
           // Check if any provider has tokens now
           const provider = Array.from(mcpOAuthClientProviders.values())[0];
@@ -2244,6 +2265,10 @@ function startPersistentCallbackServer(): void {
           }
         } catch (err) {
           debugLogger.error('❌ finishAuth failed:', err);
+          coreEvents.emit(
+            CoreEvent.OauthDisplayMessage,
+            `OAuth token exchange failed: ${getErrorMessage(err)}`,
+          );
           if (pendingCallbackReject) {
             pendingCallbackReject(toError(err));
             pendingCallbackResolve = undefined;
@@ -2255,6 +2280,10 @@ function startPersistentCallbackServer(): void {
       } else {
         debugLogger.log('⚠️ Cannot call finishAuth - transport not available');
         debugLogger.log('⚠️ activeOAuthTransport:', activeOAuthTransport);
+        coreEvents.emit(
+          CoreEvent.OauthDisplayMessage,
+          'OAuth callback received but no active transport was available to complete token exchange.',
+        );
       }
 
       if (pendingCallbackResolve) {
@@ -2343,22 +2372,37 @@ export async function getMcpOAuthClientProvider(
       // Open browser and handle callback in background
       void openBrowser(authUrl.toString());
 
-      // Handle callback asynchronously (don't block redirectToAuthorization)
-      void callbackPromise.then(() => {
-        debugLogger.log(
-          '🔐 Background: Authorization code received and finishAuth completed',
-        );
-        const tokens = provider.tokens();
-        debugLogger.log('🔍 Background: Provider tokens after callback:', {
-          hasTokens: !!tokens,
-          hasAccessToken: !!tokens?.access_token,
-          hasRefreshToken: !!tokens?.refresh_token,
+      // Handle callback asynchronously (do not block redirect callback, which
+      // can deadlock OAuth transport internals waiting for this method to return).
+      void Promise.race([
+        callbackPromise,
+        new Promise<string>((_, reject) => {
+          setTimeout(
+            () => {
+              pendingCallbackResolve = undefined;
+              pendingCallbackReject = undefined;
+              pendingExpectedState = undefined;
+              reject(new Error('OAuth callback timeout after 5 minutes'));
+            },
+            5 * 60 * 1000,
+          );
+        }),
+      ])
+        .then(() => {
+          const tokens = provider.tokens();
+          debugLogger.log('✅ OAuth callback completed');
+          debugLogger.log('🔍 Provider tokens after callback:', {
+            hasTokens: !!tokens,
+            hasAccessToken: !!tokens?.access_token,
+            hasRefreshToken: !!tokens?.refresh_token,
+          });
+        })
+        .catch((error: unknown) => {
+          debugLogger.error('❌ OAuth callback wait failed:', error);
         });
-      });
 
-      // Return immediately - don't wait for callback
       debugLogger.log(
-        '↩️ redirectToAuthorization returning immediately (callback will complete in background)',
+        '↩️ redirectToAuthorization returning immediately (callback handled asynchronously)',
       );
     },
   );
