@@ -87,7 +87,20 @@ const CALLBACK_URL = `http://localhost:${CALLBACK_PORT}/callback`;
 const isMcpOAuthReworkEnabled = (): boolean =>
   process.env['GEMINI_CLI_ENABLE_MCP_SDK_OAUTH'] !== '0';
 
-export type McpContext = Config;
+export interface McpContext {
+  readonly sanitizationConfig: EnvironmentSanitizationConfig;
+  emitMcpDiagnostic(
+    severity: 'info' | 'warning' | 'error',
+    message: string,
+    error?: unknown,
+    serverName?: string,
+  ): void;
+  setUserInteractedWithMcp?(): void;
+  isTrustedFolder(): boolean;
+  getPolicyEngine?(): {
+    getRules(): ReadonlyArray<{ toolName?: string; source?: string }>;
+  };
+}
 
 export type DiscoveredMCPPrompt = Prompt & {
   serverName: string;
@@ -2003,8 +2016,13 @@ export async function createTransport(
   mcpServerName: string,
   mcpServerConfig: MCPServerConfig,
   debugMode: boolean,
-  sanitizationConfig: EnvironmentSanitizationConfig,
+  cliConfigOrSanitizationConfig: McpContext | EnvironmentSanitizationConfig,
 ): Promise<Transport> {
+  const sanitizationConfig: EnvironmentSanitizationConfig =
+    'sanitizationConfig' in cliConfigOrSanitizationConfig
+      ? cliConfigOrSanitizationConfig.sanitizationConfig
+      : cliConfigOrSanitizationConfig;
+
   const noUrl = !mcpServerConfig.url && !mcpServerConfig.httpUrl;
   if (noUrl) {
     if (
