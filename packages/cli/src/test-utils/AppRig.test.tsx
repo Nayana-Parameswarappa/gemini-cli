@@ -20,7 +20,7 @@ describe('AppRig', () => {
     await rig?.unmount();
   });
 
-  it.skip('should handle deterministic tool turns with breakpoints', async () => {
+  it('should handle deterministic tool turns with breakpoints', async () => {
     const fakeResponsesPath = path.join(
       __dirname,
       'fixtures',
@@ -31,14 +31,8 @@ describe('AppRig', () => {
       configOverrides: { modelSteering: true },
     });
     await rig.initialize();
-    await act(async () => {
-      rig!.render();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    await rig.waitForOutput('Tips for getting started', 60000);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    });
+    rig.render();
+    await rig.waitForIdle();
 
     // Set breakpoints on the canonical tool names
     rig.setBreakpoint('list_directory');
@@ -67,7 +61,7 @@ describe('AppRig', () => {
     await rig.waitForOutput('Task complete.', 100000);
   });
 
-  it.skip('should render the app and handle a simple message', async () => {
+  it('should render the app and handle a simple message', async () => {
     const fakeResponsesPath = path.join(
       __dirname,
       'fixtures',
@@ -82,13 +76,11 @@ describe('AppRig', () => {
     });
 
     // Wait for initial render
-    await rig.waitForOutput('Tips for getting started', 60000);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    });
+    await rig.waitForIdle();
 
     // Type a message
-    await rig.sendMessage('Hello');
+    await rig.type('Hello');
+    await rig.pressEnter();
 
     // Wait for model response
     await rig.waitForOutput('Hello! How can I help you today?');

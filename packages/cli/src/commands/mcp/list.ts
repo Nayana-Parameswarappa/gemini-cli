@@ -119,12 +119,7 @@ async function testMCPConnection(
   let transport;
   try {
     // Use the same transport creation logic as core
-    transport = await createTransport(
-      serverName,
-      config,
-      false,
-      mcpContext.sanitizationConfig,
-    );
+    transport = await createTransport(serverName, config, false, mcpContext);
   } catch (_error) {
     await client.close();
     return MCPServerStatus.DISCONNECTED;

@@ -5,7 +5,6 @@
  */
 
 import { describe, it, afterEach } from 'vitest';
-import { act } from 'react';
 import { AppRig } from '../test-utils/AppRig.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +19,7 @@ describe('Model Steering Integration', () => {
     await rig?.unmount();
   });
 
-  it.skip('should steer the model using a hint during a tool turn', async () => {
+  it('should steer the model using a hint during a tool turn', async () => {
     const fakeResponsesPath = path.join(
       __dirname,
       '../test-utils/fixtures/steering.responses',
@@ -30,14 +29,8 @@ describe('Model Steering Integration', () => {
       configOverrides: { modelSteering: true },
     });
     await rig.initialize();
-    await act(async () => {
-      rig!.render();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    await rig.waitForOutput('Tips for getting started', 60000);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    });
+    rig.render();
+    await rig.waitForIdle();
 
     rig.setToolPolicy('list_directory', PolicyDecision.ASK_USER);
     rig.setToolPolicy('read_file', PolicyDecision.ASK_USER);
