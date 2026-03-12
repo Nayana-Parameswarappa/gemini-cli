@@ -55,10 +55,7 @@ import { basename } from 'node:path';
 import { pathToFileURL, URL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { McpAuthProvider } from '../mcp/auth-provider.js';
-import {
-  MCPOAuthProvider,
-  type MCPOAuthConfig,
-} from '../mcp/oauth-provider.js';
+import type { MCPOAuthConfig } from '../mcp/oauth-provider.js';
 import { MCPOAuthTokenStorage } from '../mcp/oauth-token-storage.js';
 import { OAuthUtils } from '../mcp/oauth-utils.js';
 import type { PromptRegistry } from '../prompts/prompt-registry.js';
@@ -72,6 +69,7 @@ import { exec } from 'node:child_process';
 import type {
   OAuthClientInformation,
   OAuthClientMetadata,
+  OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import * as crypto from 'node:crypto';
 import type { ToolRegistry } from './tool-registry.js';
@@ -1519,6 +1517,117 @@ async function getStoredOAuthToken(serverName: string): Promise<string | null> {
   return credentials.token.accessToken;
 }
 
+async function persistOAuthTokens(
+  serverName: string,
+  sdkTokens: OAuthTokens,
+): Promise<void> {
+  if (!sdkTokens.access_token) {
+    return;
+  }
+
+  debugLogger.log('💾 Saving OAuth tokens to persistent storage...');
+  const tokenStorage = new MCPOAuthTokenStorage();
+  const expiresAt = Date.now() + (sdkTokens.expires_in || 3600) * 1000;
+
+  await tokenStorage.setCredentials({
+    serverName,
+    token: {
+      accessToken: sdkTokens.access_token,
+      tokenType: sdkTokens.token_type,
+      refreshToken: sdkTokens.refresh_token,
+      scope: sdkTokens.scope,
+      expiresAt,
+    },
+    updatedAt: Date.now(),
+  });
+
+  debugLogger.log('✅ Tokens saved to storage');
+}
+
+async function waitForOAuthAccessToken(
+  serverName: string,
+  oauthProvider: MCPOAuthClientProvider,
+  timeoutMs: number,
+): Promise<string | null> {
+  const timeoutAt = Date.now() + timeoutMs;
+
+  while (Date.now() < timeoutAt) {
+    const sdkTokens = oauthProvider.tokens();
+    if (sdkTokens?.access_token) {
+      await persistOAuthTokens(serverName, sdkTokens);
+      return sdkTokens.access_token;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  return null;
+}
+
+async function performOAuthAuthorization(
+  mcpServerName: string,
+  mcpServerConfig: MCPServerConfig,
+  mcpServerUrl: string,
+  oauthConfig: MCPOAuthConfig,
+  sanitizationConfig: EnvironmentSanitizationConfig,
+  useBaseUrlForAuthProbe: boolean,
+): Promise<string | null> {
+  const oauthProvider = await getMcpOAuthClientProvider(
+    mcpServerName,
+    mcpServerConfig,
+  );
+
+  if (oauthConfig.clientId) {
+    const clientInformation: OAuthClientInformation = {
+      client_id: oauthConfig.clientId,
+      ...(oauthConfig.clientSecret
+        ? { client_secret: oauthConfig.clientSecret }
+        : {}),
+    };
+    oauthProvider.saveClientInformation(clientInformation);
+  }
+
+  const authProbeUrl = useBaseUrlForAuthProbe
+    ? OAuthUtils.extractBaseUrl(mcpServerUrl)
+    : mcpServerUrl;
+
+  const authTransport = new StreamableHTTPClientTransport(
+    new URL(authProbeUrl),
+    {
+      requestInit: createTransportRequestInit(
+        mcpServerConfig,
+        {},
+        sanitizationConfig,
+      ),
+      authProvider: oauthProvider,
+    },
+  );
+  activeOAuthTransport = authTransport;
+
+  try {
+    try {
+      await authTransport.start();
+    } catch (error) {
+      const authError = toError(error);
+      if (!isAuthenticationError(authError)) {
+        throw authError;
+      }
+    }
+
+    return await waitForOAuthAccessToken(
+      mcpServerName,
+      oauthProvider,
+      mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
+    );
+  } finally {
+    try {
+      await authTransport.close();
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
+}
+
 /**
  * Helper function to create an SSE transport with optional OAuth authentication.
  *
@@ -1724,21 +1833,7 @@ export async function connectToMcpServer(
         );
         const sdkTokens = oauthProvider.tokens();
         if (sdkTokens) {
-          debugLogger.log('💾 Saving OAuth tokens to persistent storage...');
-          const tokenStorage = new MCPOAuthTokenStorage();
-          const expiresAt = Date.now() + (sdkTokens.expires_in || 3600) * 1000;
-          await tokenStorage.setCredentials({
-            serverName: mcpServerName,
-            token: {
-              accessToken: sdkTokens.access_token,
-              tokenType: sdkTokens.token_type,
-              refreshToken: sdkTokens.refresh_token,
-              scope: sdkTokens.scope,
-              expiresAt,
-            },
-            updatedAt: Date.now(),
-          });
-          debugLogger.log('✅ Tokens saved to storage');
+          await persistOAuthTokens(mcpServerName, sdkTokens);
         }
 
         return mcpClient;
@@ -1850,15 +1945,13 @@ export async function connectToMcpServer(
           mcpServerConfig.oauth?.scopes ?? discoveredOauthConfig?.scopes ?? [],
       };
 
-      const oauthProvider = new MCPOAuthProvider(new MCPOAuthTokenStorage());
-      await oauthProvider.authenticate(
+      const accessToken = await performOAuthAuthorization(
         mcpServerName,
-        oauthConfig,
+        mcpServerConfig,
         mcpServerUrl,
-      );
-      const accessToken = await oauthProvider.getValidToken(
-        mcpServerName,
         oauthConfig,
+        cliConfig.sanitizationConfig,
+        httpReturned404,
       );
 
       if (httpReturned404 && mcpServerConfig.url && !mcpServerConfig.type) {
@@ -1901,6 +1994,26 @@ async function createUrlTransport(
     | StreamableHTTPClientTransportOptions
     | SSEClientTransportOptions,
 ): Promise<StreamableHTTPClientTransport | SSEClientTransport> {
+  const ensureOAuthProvider = async (): Promise<void> => {
+    if (transportOptions.authProvider || !mcpServerConfig.oauth?.enabled) {
+      return;
+    }
+
+    const oauthProvider = await getMcpOAuthClientProvider(
+      mcpServerName,
+      mcpServerConfig,
+    );
+    if (mcpServerConfig.oauth.clientId && mcpServerConfig.oauth.clientSecret) {
+      const clientInformation: OAuthClientInformation = {
+        client_id: mcpServerConfig.oauth.clientId,
+        client_secret: mcpServerConfig.oauth.clientSecret,
+      };
+      oauthProvider.saveClientInformation(clientInformation);
+    }
+
+    transportOptions.authProvider = oauthProvider;
+  };
+
   // Priority 1: httpUrl (deprecated)
   if (mcpServerConfig.httpUrl) {
     if (mcpServerConfig.url) {
@@ -1909,25 +2022,7 @@ async function createUrlTransport(
           `Using deprecated 'httpUrl'. Please migrate to 'url' with 'type: "http"'.`,
       );
     }
-    if (!transportOptions.authProvider) {
-      debugLogger.log('🔧 Creating OAuth provider for httpUrl transport');
-      const oauthProvider = await getMcpOAuthClientProvider(
-        mcpServerName,
-        mcpServerConfig,
-      );
-      if (
-        mcpServerConfig.oauth?.clientId &&
-        mcpServerConfig.oauth?.clientSecret
-      ) {
-        const clientInformation: OAuthClientInformation = {
-          client_id: mcpServerConfig.oauth.clientId,
-          client_secret: mcpServerConfig.oauth.clientSecret,
-        };
-        oauthProvider.saveClientInformation(clientInformation);
-      }
-      transportOptions.authProvider = oauthProvider;
-      debugLogger.log('✅ OAuth provider created and set');
-    }
+    await ensureOAuthProvider();
 
     const transport = new StreamableHTTPClientTransport(
       new URL(mcpServerConfig.httpUrl),
@@ -1950,6 +2045,7 @@ async function createUrlTransport(
   // Priority 2 & 3: url with explicit type
   if (mcpServerConfig.url && mcpServerConfig.type) {
     if (mcpServerConfig.type === 'http') {
+      await ensureOAuthProvider();
       const transport = new StreamableHTTPClientTransport(
         new URL(mcpServerConfig.url),
         transportOptions,
@@ -1970,6 +2066,7 @@ async function createUrlTransport(
 
   // Priority 4: url without type (default to HTTP)
   if (mcpServerConfig.url) {
+    await ensureOAuthProvider();
     const transport = new StreamableHTTPClientTransport(
       new URL(mcpServerConfig.url),
       transportOptions,
